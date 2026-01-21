@@ -1,39 +1,18 @@
 import path from 'path';
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig(({ mode }) => {
-    const env = loadEnv(mode, '.', '');
-    return {
-      root: 'client',
-      server: {
-        port: 5000,
-        host: '0.0.0.0',
-        allowedHosts: true,
-        hmr: false,
-        proxy: {
-          '/api/': {
-            target: 'http://localhost:3001',
-            changeOrigin: true,
-            secure: false,
-          },
-        },
-      },
-      build: {
-        outDir: '../dist',
-        emptyOutDir: true,
-      },
-      plugins: [react()],
-      define: {
-        'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
-      },
-      resolve: {
-        alias: {
-          '@': path.resolve(__dirname, '.'),
-          '@shared': path.resolve(__dirname, 'shared'),
-          '@assets': path.resolve(__dirname, 'attached_assets'),
-        }
-      }
-    };
+export default defineConfig({
+  root: 'client',
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, 'client', 'src'),
+      '@shared': path.resolve(__dirname, 'shared'),
+    },
+  },
+  build: {
+    outDir: '../dist/public',
+    emptyOutDir: true,
+  },
 });
