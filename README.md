@@ -18,20 +18,22 @@ AI-powered course generation platform that transforms ebooks, ideas, and notes i
 ```
 ├── client/
 │   ├── src/
-│   │   ├── App.tsx          # Main React app
-│   │   ├── api.ts           # API client layer
-│   │   ├── types.ts         # TypeScript interfaces
-│   │   ├── constants.ts     # App constants & defaults
-│   │   ├── utils.ts         # Helper functions
-│   │   └── index.tsx        # Entry point
+│   │   ├── App.tsx           # Main React app
+│   │   ├── api.ts            # API client layer
+│   │   ├── types.ts          # TypeScript interfaces
+│   │   ├── constants.ts      # App constants & defaults
+│   │   ├── utils.ts          # Helper functions
+│   │   ├── components/       # Reusable UI components
+│   │   ├── views/            # Page components
+│   │   └── index.tsx         # Entry point
 │   └── index.html
 ├── server/
-│   ├── index.ts             # Express server & API routes
-│   ├── db.ts                # Drizzle database connection
-│   ├── objectStorage.ts     # Google Cloud Storage service
-│   └── objectAcl.ts         # Storage access control
+│   ├── index.ts              # Express server & API routes
+│   ├── db.ts                 # Drizzle database connection
+│   ├── objectStorage.ts      # Google Cloud Storage service
+│   └── objectAcl.ts          # Storage access control
 ├── shared/
-│   └── schema.ts            # Database schema (Drizzle)
+│   └── schema.ts             # Database schema (Drizzle)
 ├── package.json
 ├── vite.config.ts
 └── tsconfig.json
@@ -68,7 +70,7 @@ npm run dev
 - 📚 Generate courses from ebooks, PDFs, or text input
 - 🎨 AI-generated visuals for each lesson
 - 🎙️ AI voice narration with word-level timestamps
-- 📊 Student progress tracking
+- 📈 Student progress tracking
 - 🎓 Certificate generation
 - 👥 Multi-user support (Admin, Instructor, Student roles)
 - 🎫 Support ticket system
@@ -79,6 +81,10 @@ This project was migrated from Replit. The AI integration layer (`server/replit_
 - OpenAI API for chat completions
 - Replicate API for Flux image generation
 - ElevenLabs API for text-to-speech
+
+## Deployment
+
+Deployed on Railway with automatic deploys from GitHub.
 
 ## License
 
