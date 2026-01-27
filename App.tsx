@@ -60,14 +60,43 @@ export const App = () => {
   const [currentView, setCurrentView] = useState('dashboard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth > 1024);
   const [loginType, setLoginType] = useState<'student' | 'admin'>('student');
-  const [showPromo, setShowPromo] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('promo') === 'true';
+  // URL-based routing for promo and packages pages
+  const [showPromo, setShowPromoState] = useState(() => {
+    return window.location.pathname === '/promo';
   });
-  const [showPackages, setShowPackages] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('page') === 'packages';
+  const [showPackages, setShowPackagesState] = useState(() => {
+    return window.location.pathname === '/packages';
   });
+
+  // Wrapper functions to update URL when changing state
+  const setShowPromo = (show: boolean) => {
+    if (show) {
+      window.history.pushState({}, '', '/promo');
+    } else {
+      window.history.pushState({}, '', '/');
+    }
+    setShowPromoState(show);
+  };
+
+  const setShowPackages = (show: boolean) => {
+    if (show) {
+      window.history.pushState({}, '', '/packages');
+    } else {
+      window.history.pushState({}, '', '/');
+    }
+    setShowPackagesState(show);
+  };
+
+
+  // Handle browser back/forward buttons
+  useEffect(() => {
+    const handlePopState = () => {
+      setShowPromoState(window.location.pathname === '/promo');
+      setShowPackagesState(window.location.pathname === '/packages');
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   // Persist session to localStorage when user changes
   useEffect(() => {
