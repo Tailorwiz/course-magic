@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React from 'react';
 import { ArrowLeft, ArrowRight, Play, Users, Award, TrendingUp } from 'lucide-react';
 
 interface PromoPageProps {
@@ -6,21 +6,9 @@ interface PromoPageProps {
   onShowPackages?: () => void;
 }
 
-const PROMO_VIDEO_URL = '/media/video/promo-video.mp4';
+const YOUTUBE_VIDEO_ID = '6SkRX2bvwf4';
 
 export const PromoPage: React.FC<PromoPageProps> = ({ onBack, onShowPackages }) => {
-  const [isPlaying, setIsPlaying] = useState(false);
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  const posterImage = '/media/images/promo-cover.jpeg';
-
-  const handlePlayClick = () => {
-    if (videoRef.current) {
-      videoRef.current.play();
-      setIsPlaying(true);
-    }
-  };
-
   return (
     <div className="min-h-screen w-full flex flex-col" style={{ backgroundColor: '#1a1f3c' }}>
       <style>{`
@@ -51,39 +39,6 @@ export const PromoPage: React.FC<PromoPageProps> = ({ onBack, onShowPackages }) 
           position: relative;
           overflow: hidden;
           border-radius: 16px;
-        }
-        .video-overlay {
-          position: absolute;
-          inset: 0;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          cursor: pointer;
-          transition: opacity 0.3s ease;
-          background: rgba(0,0,0,0.15);
-        }
-        .cover-image {
-          position: absolute;
-          inset: 0;
-          width: 100%;
-          height: 100%;
-          object-fit: cover;
-          filter: brightness(1.15) contrast(1.1) saturate(1.2);
-        }
-        .play-button {
-          width: 100px;
-          height: 100px;
-          background: rgba(212, 175, 55, 0.95);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          transition: all 0.3s ease;
-          box-shadow: 0 8px 30px rgba(212, 175, 55, 0.5);
-        }
-        .play-button:hover {
-          transform: scale(1.1);
-          box-shadow: 0 12px 40px rgba(212, 175, 55, 0.6);
         }
       `}</style>
 
@@ -169,41 +124,19 @@ export const PromoPage: React.FC<PromoPageProps> = ({ onBack, onShowPackages }) 
           </div>
 
           <div className="video-container shadow-2xl" style={{ border: '3px solid #D4AF37' }}>
-            <video
-              ref={videoRef}
-              className="w-full aspect-video bg-black"
-              controls={isPlaying}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              onEnded={() => setIsPlaying(false)}
-              playsInline
-              style={{ display: isPlaying ? 'block' : 'none' }}
-            >
-              <source src={PROMO_VIDEO_URL} type="video/mp4" />
-              <source src={PROMO_VIDEO_URL.replace('.mp4', '.webm')} type="video/webm" />
-              Your browser does not support the video tag.
-            </video>
-            {!isPlaying && (
-              <>
-                <div className="w-full aspect-video bg-black relative">
-                  <img 
-                    src={posterImage} 
-                    alt="Video Cover" 
-                    className="cover-image"
-                  />
-                </div>
-                <div className="video-overlay" onClick={handlePlayClick}>
-                  <div className="flex flex-col items-center gap-4">
-                    <div className="play-button">
-                      <Play size={44} fill="white" color="white" style={{ marginLeft: '6px' }} />
-                    </div>
-                    <span className="text-2xl md:text-3xl font-bold text-white uppercase tracking-wide" style={{ textShadow: '0 2px 10px rgba(0,0,0,0.8)' }}>
-                      Watch FREE Video!
-                    </span>
-                  </div>
-                </div>
-              </>
-            )}
+            <div className="w-full aspect-video">
+              <iframe
+                width="100%"
+                height="100%"
+                src={`https://www.youtube.com/embed/${YOUTUBE_VIDEO_ID}?rel=0`}
+                title="Why Executives Choose Marcus Hall"
+                frameBorder="0"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                referrerPolicy="strict-origin-when-cross-origin"
+                allowFullScreen
+                style={{ display: 'block' }}
+              ></iframe>
+            </div>
           </div>
 
           <div className="flex flex-col items-center gap-6 mt-8">
