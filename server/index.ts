@@ -2769,6 +2769,23 @@ app.get("/api/debug/test-email", async (req, res) => {
   }
 });
 
+
+
+// Debug endpoint to list students
+app.get("/api/debug/list-students", async (req, res) => {
+  try {
+    const students = await db.select({
+      id: users.id,
+      name: users.name,
+      email: users.email
+    }).from(users).where(eq(users.role, 'student')).limit(10);
+    
+    res.json({ count: students.length, students });
+  } catch (error: any) {
+    res.json({ error: error?.message });
+  }
+});
+
 // Debug endpoint to test sending to any email
 app.get("/api/debug/test-send/:email", async (req, res) => {
   const resendKey = process.env.RESEND_API_KEY;
@@ -2806,55 +2823,9 @@ app.get("/api/debug/test-send/:email", async (req, res) => {
 });
 
 // Send login credentials to a student
-
-
-// Debug endpoint to test sending credentials to a specific student ID
-app.get("/api/debug/test-student/:id", async (req, res) => {
-  try {
-    const studentId = req.params.id;
-    console.log('[DEBUG] Testing student ID:', studentId);
-    
-    const resendKey = process.env.RESEND_API_KEY;
-    if (!resendKey) {
-      return res.status(500).json({ error: "RESEND_API_KEY not set" });
-    }
-    
-    // Look up student
-    const [student] = await db.select().from(users).where(eq(users.id, studentId));
-    
-    if (!student) {
-      return res.json({ error: "Student not found", studentId });
-    }
-    
-    if (!student.email) {
-      return res.json({ error: "Student has no email", studentId, student: { id: student.id, name: student.name } });
-    }
-    
-    // Try to send
-    const loginUrl = 'https://www.jobsondemandacademy.com/login';
-    const emailHtml = `<p>Test credentials email for ${student.name || 'Student'}</p><p>Email: ${student.email}</p>`;
-    
-    const result = await sendEmailWithResend(student.email, 'Test Credentials Email', emailHtml);
-    
-    res.json({ 
-      success: true, 
-      message: "Email sent!", 
-      id: result.id,
-      student: { id: student.id, name: student.name, email: student.email }
-    });
-    
-  } catch (error: any) {
-    console.error('[DEBUG] Error:', error);
-    res.json({ error: error?.message || 'Unknown error', stack: error?.stack });
-  }
-});
-
-// Send credentials endpoint
 app.post("/api/students/send-credentials", async (req, res) => {
-  console.log('[SEND-CREDENTIALS] Request received:', JSON.stringify(req.body));
   try {
     const { studentId, studentIds } = req.body;
-    console.log('[SEND-CREDENTIALS] studentId:', studentId, 'studentIds:', studentIds);
     
     // Handle both single and bulk requests
     const idsToProcess = studentIds || (studentId ? [studentId] : []);
@@ -2873,9 +2844,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
     
     for (const id of idsToProcess) {
       try {
-        console.log('[SEND-CREDENTIALS] Looking up student ID:', id);
         const [student] = await db.select().from(users).where(eq(users.id, id));
-        console.log('[SEND-CREDENTIALS] Found student:', student ? student.email : 'NOT FOUND');
         
         if (!student) {
           results.push({ studentId: id, email: '', success: false, error: 'Student not found' });
@@ -2932,7 +2901,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
         results.push({ studentId: id, email: student.email, success: true });
         
       } catch (emailError: any) {
-        console.error('[EMAIL] Error sending to student', id, ':', emailError?.message, emailError?.stack);
+        console.error('[EMAIL] Error sending to student', id, ':', emailError);
         results.push({ studentId: id, email: '', success: false, error: emailError?.message || 'Failed to send' });
       }
     }
