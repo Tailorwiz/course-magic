@@ -2728,14 +2728,45 @@ const sendEmailWithResend = async (to: string, subject: string, html: string) =>
 
 // Debug endpoint to check SMTP configuration
 app.get("/api/debug/smtp-status", async (req, res) => {
-  const smtpEmail = process.env.SMTP_EMAIL;
-  const smtpPassword = process.env.SMTP_PASSWORD;
+  const resendKey = process.env.RESEND_API_KEY;
   res.json({
-    smtp_email_set: !!smtpEmail,
-    smtp_email_value: smtpEmail ? smtpEmail.substring(0, 5) + '***' : null,
-    smtp_password_set: !!smtpPassword,
-    smtp_password_length: smtpPassword ? smtpPassword.length : 0
+    resend_api_key_set: !!resendKey,
+    resend_api_key_prefix: resendKey ? resendKey.substring(0, 10) + '***' : null,
   });
+});
+
+// Test email endpoint using Resend
+app.get("/api/debug/test-email", async (req, res) => {
+  const resendKey = process.env.RESEND_API_KEY;
+  if (!resendKey) {
+    return res.json({ success: false, error: "RESEND_API_KEY not set" });
+  }
+  
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${resendKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: "onboarding@resend.dev",
+        to: "marcushall2023@gmail.com",
+        subject: "Test Email from Jobs on Demand Academy",
+        html: "<h1>Email is working!</h1><p>This test email was sent via Resend API.</p>"
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (response.ok) {
+      res.json({ success: true, message: "Test email sent!", id: data.id });
+    } else {
+      res.json({ success: false, error: data.message || "Unknown error", details: data });
+    }
+  } catch (error: any) {
+    res.json({ success: false, error: error.message });
+  }
 });
 
 // Send login credentials to a student
