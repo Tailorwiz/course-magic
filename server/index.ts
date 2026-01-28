@@ -2691,31 +2691,39 @@ app.get("/api/db-info", async (req, res) => {
 
 // ============ EMAIL CREDENTIALS ============
 
-// Create Gmail transporter
-const createEmailTransporter = () => {
-  const email = process.env.SMTP_EMAIL;
-  const password = process.env.SMTP_PASSWORD;
+// Send email via Resend API (HTTP-based, works on Railway)
+const sendEmailWithResend = async (to: string, subject: string, html: string) => {
+  const resendKey = process.env.RESEND_API_KEY;
   
-  console.log('[EMAIL] SMTP_EMAIL configured:', !!email);
-  console.log('[EMAIL] SMTP_PASSWORD configured:', !!password);
+  console.log('[EMAIL] RESEND_API_KEY configured:', !!resendKey);
   
-  if (!email || !password) {
-    console.log('[EMAIL] Missing SMTP credentials');
-    return null;
+  if (!resendKey) {
+    throw new Error("RESEND_API_KEY not configured");
   }
   
-  return nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    auth: {
-      user: email,
-      pass: password
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + resendKey,
+      "Content-Type": "application/json"
     },
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 10000
+    body: JSON.stringify({
+      from: "Jobs on Demand Academy <onboarding@resend.dev>",
+      to: [to],
+      subject: subject,
+      html: html
+    })
   });
+  
+  if (!response.ok) {
+    const error = await response.json();
+    console.error('[EMAIL] Resend error:', error);
+    throw new Error(error.message || "Failed to send email");
+  }
+  
+  const result = await response.json();
+  console.log('[EMAIL] Sent successfully:', result.id);
+  return result;
 };
 
 // Debug endpoint to check SMTP configuration
@@ -2742,9 +2750,9 @@ app.post("/api/students/send-credentials", async (req, res) => {
       return res.status(400).json({ error: "No student IDs provided" });
     }
     
-    const transporter = createEmailTransporter();
-    if (!transporter) {
-      return res.status(500).json({ error: "Email not configured. Please set SMTP_EMAIL and SMTP_PASSWORD environment variables." });
+    const resendKey = process.env.RESEND_API_KEY;
+    if (!resendKey) {
+      return res.status(500).json({ error: "Email not configured. Please set RESEND_API_KEY environment variable." });
     }
     
     // Get student info from database
@@ -2769,14 +2777,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
           ? 'https://www.jobsondemandacademy.com/login'
           : 'http://localhost:5173/login';
         
-        const mailOptions = {
-          from: {
-            name: 'Jobs on Demand Academy',
-            address: process.env.SMTP_EMAIL!
-          },
-          to: student.email,
-          subject: 'Your Jobs on Demand Academy Login Credentials',
-          html: `
+        const emailHtml = `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
               <div style="background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); padding: 30px; border-radius: 12px 12px 0 0; text-align: center;">
                 <h1 style="color: white; margin: 0; font-size: 28px;">Jobs on Demand Academy</h1>
@@ -2802,7 +2803,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
                 </div>
                 
                 <p style="color: #64748b; font-size: 14px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
-                  If you have any questions, please contact us at ${process.env.SMTP_EMAIL}
+                  If you have any questions, please contact support.
                 </p>
               </div>
               
@@ -2810,10 +2811,9 @@ app.post("/api/students/send-credentials", async (req, res) => {
                 © ${new Date().getFullYear()} Jobs on Demand Academy. All rights reserved.
               </div>
             </div>
-          `
-        };
+          `;
         
-        await transporter.sendMail(mailOptions);
+        await sendEmailWithResend(student.email, 'Your Jobs on Demand Academy Login Credentials', emailHtml);
         results.push({ studentId: id, email: student.email, success: true });
         
       } catch (emailError: any) {
