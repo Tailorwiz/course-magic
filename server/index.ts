@@ -25,6 +25,8 @@ const upload = multer({
 
 import fs from "fs";
 import crypto from "crypto";
+import nodemailer from "nodemailer";
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2683,6 +2685,129 @@ app.get("/api/db-info", async (req, res) => {
     });
   } catch (error: any) {
     res.status(500).json({ error: error?.message, database: 'error' });
+  }
+});
+
+
+// ============ EMAIL CREDENTIALS ============
+
+// Create Gmail transporter
+const createEmailTransporter = () => {
+  if (!process.env.SMTP_EMAIL || !process.env.SMTP_PASSWORD) {
+    return null;
+  }
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.SMTP_EMAIL,
+      pass: process.env.SMTP_PASSWORD
+    }
+  });
+};
+
+// Send login credentials to a student
+app.post("/api/students/send-credentials", async (req, res) => {
+  try {
+    const { studentId, studentIds } = req.body;
+    
+    // Handle both single and bulk requests
+    const idsToProcess = studentIds || (studentId ? [studentId] : []);
+    
+    if (idsToProcess.length === 0) {
+      return res.status(400).json({ error: "No student IDs provided" });
+    }
+    
+    const transporter = createEmailTransporter();
+    if (!transporter) {
+      return res.status(500).json({ error: "Email not configured. Please set SMTP_EMAIL and SMTP_PASSWORD environment variables." });
+    }
+    
+    // Get student info from database
+    const results: { studentId: string; email: string; success: boolean; error?: string }[] = [];
+    
+    for (const id of idsToProcess) {
+      try {
+        const [student] = await db.select().from(users).where(eq(users.id, id));
+        
+        if (!student) {
+          results.push({ studentId: id, email: '', success: false, error: 'Student not found' });
+          continue;
+        }
+        
+        if (!student.email) {
+          results.push({ studentId: id, email: '', success: false, error: 'No email address' });
+          continue;
+        }
+        
+        // Send email
+        const loginUrl = process.env.NODE_ENV === 'production' 
+          ? 'https://www.jobsondemandacademy.com/login'
+          : 'http://localhost:5173/login';
+        
+        const mailOptions = {
+          from: {
+            name: 'Jobs on Demand Academy',
+            address: process.env.SMTP_EMAIL!
+          },
+          to: student.email,
+          subject: 'Your Jobs on Demand Academy Login Credentials',
+          html: \`
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <div style="background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); padding: 30px; border-radius: 12px 12px 0 0; text-align: center;">
+                <h1 style="color: white; margin: 0; font-size: 28px;">Jobs on Demand Academy</h1>
+                <p style="color: rgba(255,255,255,0.9); margin-top: 8px;">Your Executive Career Training Portal</p>
+              </div>
+              
+              <div style="background: #f8fafc; padding: 30px; border: 1px solid #e2e8f0; border-top: none;">
+                <h2 style="color: #1e293b; margin-top: 0;">Welcome, \${student.name || 'Student'}!</h2>
+                <p style="color: #475569; line-height: 1.6;">
+                  Your account has been created. Here are your login credentials:
+                </p>
+                
+                <div style="background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; margin: 20px 0;">
+                  <p style="margin: 8px 0; color: #334155;"><strong>Email:</strong> \${student.email}</p>
+                  <p style="margin: 8px 0; color: #334155;"><strong>Password:</strong> \${student.password || '(Set by administrator)'}</p>
+                </div>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                  <a href="\${loginUrl}" 
+                     style="display: inline-block; background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;">
+                    Login to Your Account
+                  </a>
+                </div>
+                
+                <p style="color: #64748b; font-size: 14px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                  If you have any questions, please contact us at \${process.env.SMTP_EMAIL}
+                </p>
+              </div>
+              
+              <div style="text-align: center; padding: 20px; color: #94a3b8; font-size: 12px;">
+                © \${new Date().getFullYear()} Jobs on Demand Academy. All rights reserved.
+              </div>
+            </div>
+          \`
+        };
+        
+        await transporter.sendMail(mailOptions);
+        results.push({ studentId: id, email: student.email, success: true });
+        
+      } catch (emailError: any) {
+        results.push({ studentId: id, email: '', success: false, error: emailError?.message || 'Failed to send' });
+      }
+    }
+    
+    const successCount = results.filter(r => r.success).length;
+    const failCount = results.filter(r => !r.success).length;
+    
+    res.json({ 
+      success: failCount === 0,
+      message: \`Sent \${successCount} of \${idsToProcess.length} emails\`,
+      results 
+    });
+    
+  } catch (error: any) {
+    console.error("Error sending credentials:", error);
+    res.status(500).json({ error: error?.message || "Failed to send credentials" });
   }
 });
 
