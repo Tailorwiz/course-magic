@@ -2693,17 +2693,37 @@ app.get("/api/db-info", async (req, res) => {
 
 // Create Gmail transporter
 const createEmailTransporter = () => {
-  if (!process.env.SMTP_EMAIL || !process.env.SMTP_PASSWORD) {
+  const email = process.env.SMTP_EMAIL;
+  const password = process.env.SMTP_PASSWORD;
+  
+  console.log('[EMAIL] SMTP_EMAIL configured:', !!email);
+  console.log('[EMAIL] SMTP_PASSWORD configured:', !!password);
+  
+  if (!email || !password) {
+    console.log('[EMAIL] Missing SMTP credentials');
     return null;
   }
+  
   return nodemailer.createTransport({
     service: 'gmail',
     auth: {
-      user: process.env.SMTP_EMAIL,
-      pass: process.env.SMTP_PASSWORD
+      user: email,
+      pass: password
     }
   });
 };
+
+// Debug endpoint to check SMTP configuration
+app.get("/api/debug/smtp-status", async (req, res) => {
+  const smtpEmail = process.env.SMTP_EMAIL;
+  const smtpPassword = process.env.SMTP_PASSWORD;
+  res.json({
+    smtp_email_set: !!smtpEmail,
+    smtp_email_value: smtpEmail ? smtpEmail.substring(0, 5) + '***' : null,
+    smtp_password_set: !!smtpPassword,
+    smtp_password_length: smtpPassword ? smtpPassword.length : 0
+  });
+});
 
 // Send login credentials to a student
 app.post("/api/students/send-credentials", async (req, res) => {
@@ -2792,6 +2812,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
         results.push({ studentId: id, email: student.email, success: true });
         
       } catch (emailError: any) {
+        console.error('[EMAIL] Error sending to student', id, ':', emailError);
         results.push({ studentId: id, email: '', success: false, error: emailError?.message || 'Failed to send' });
       }
     }
