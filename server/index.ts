@@ -1452,10 +1452,57 @@ app.get("/api/courses", async (req, res) => {
 
 app.get("/api/courses/:id", async (req, res) => {
   try {
-    const [course] = await db.select().from(courses).where(eq(courses.id, req.params.id));
+    const courseId = req.params.id;
+    const [course] = await db.select().from(courses).where(eq(courses.id, courseId));
     if (!course) return res.status(404).json({ error: "Course not found" });
-    res.json({ ...course.data as object, _dbId: course.id });
-  } catch (error) {
+    
+    // Get the course data
+    const courseData = { ...course.data as any, _dbId: course.id };
+    
+    // Fetch all images from lesson_images table for this course
+    const images = await db.select().from(lessonImages).where(eq(lessonImages.courseId, courseId));
+    
+    // Create a map of lessonId -> visualIndex -> imageData
+    const imageMap: Record<string, Record<string, { imageData: string; prompt: string | null }>> = {};
+    for (const img of images) {
+      if (!imageMap[img.lessonId]) imageMap[img.lessonId] = {};
+      let imgData = img.imageData;
+      // Ensure data URL prefix
+      if (imgData && !imgData.startsWith('data:')) {
+        imgData = `data:image/png;base64,${imgData}`;
+      }
+      imageMap[img.lessonId][img.visualIndex] = { 
+        imageData: imgData, 
+        prompt: img.prompt 
+      };
+    }
+    
+    // Merge images into course visuals
+    if (courseData.modules && Array.isArray(courseData.modules)) {
+      for (const module of courseData.modules) {
+        if (module.lessons && Array.isArray(module.lessons)) {
+          for (const lesson of module.lessons) {
+            const lessonImgs = imageMap[lesson.id];
+            if (lessonImgs && lesson.visuals && Array.isArray(lesson.visuals)) {
+              for (let i = 0; i < lesson.visuals.length; i++) {
+                const storedImage = lessonImgs[String(i)];
+                if (storedImage && storedImage.imageData) {
+                  lesson.visuals[i].imageData = storedImage.imageData;
+                  if (storedImage.prompt) {
+                    lesson.visuals[i].prompt = storedImage.prompt;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    console.log(`[Get Course] Loaded course ${courseId} with ${images.length} images from DB`);
+    res.json(courseData);
+  } catch (error: any) {
+    console.error("Get course error:", error.message || error);
     res.status(500).json({ error: "Failed to get course" });
   }
 });
