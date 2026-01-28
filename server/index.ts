@@ -2706,8 +2706,8 @@ const createEmailTransporter = () => {
   
   return nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
+    port: 465,
+    secure: true,
     auth: {
       user: email,
       pass: password
@@ -2729,47 +2729,6 @@ app.get("/api/debug/smtp-status", async (req, res) => {
     smtp_password_length: smtpPassword ? smtpPassword.length : 0
   });
 });
-
-// Test endpoint to send a test email and see actual error
-app.get("/api/debug/test-email", async (req, res) => {
-  const smtpEmail = process.env.SMTP_EMAIL;
-  const smtpPassword = process.env.SMTP_PASSWORD;
-  
-  if (!smtpEmail || !smtpPassword) {
-    return res.json({ success: false, error: "SMTP not configured" });
-  }
-  
-  try {
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,
-      auth: {
-        user: smtpEmail,
-        pass: smtpPassword
-      },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 10000
-    });
-    
-    // Verify connection
-    await transporter.verify();
-    
-    return res.json({ 
-      success: true, 
-      message: "SMTP connection verified successfully!" 
-    });
-  } catch (error: any) {
-    return res.json({ 
-      success: false, 
-      error: error.message,
-      code: error.code,
-      command: error.command
-    });
-  }
-});
-
 
 // Send login credentials to a student
 app.post("/api/students/send-credentials", async (req, res) => {
