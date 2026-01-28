@@ -428,17 +428,20 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
       if (!courseDetails.title) { alert("Title required."); return; }
       setIsGeneratingEcover(true);
       try {
-           const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-           const parts: any[] = [];
-           let isEditing = false;
-           if (ecoverPreview && ecoverPreview.startsWith('data:image')) { isEditing = true; const base64Data = ecoverPreview.split(',')[1]; const mimeType = ecoverPreview.split(';')[0].split(':')[1]; parts.push({ inlineData: { data: base64Data, mimeType: mimeType } }); }
-           let prompt = "";
-           if (isEditing) { prompt = `TASK: Edit text on image. Replace Title with: "${courseDetails.title}". Replace Subtitle with: "${courseDetails.headline || ''}". Keep background/layout. USER OVERRIDES: "${ecoverInstructions}"`; } 
-           else { prompt = `Design book cover for "${courseDetails.title}". Headline: "${courseDetails.headline || ''}". STYLE: High-end corporate. USER INSTRUCTIONS: "${ecoverInstructions}"`; }
-           parts.push({ text: prompt });
-           const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts: parts }, config: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: '2:3', imageSize: '1K' } } }));
-           if (response.candidates?.[0]?.content?.parts) { for (const part of response.candidates[0].content.parts) { if (part.inlineData && part.inlineData.data) { setEcoverPreview(`data:image/png;base64,${part.inlineData.data}`); break; } } }
-      } catch (e) { alert("Generation failed."); } finally { setIsGeneratingEcover(false); }
+           const response = await fetch('/api/ai/generate-cover', {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({
+               title: courseDetails.title,
+               headline: courseDetails.headline || '',
+               instructions: ecoverInstructions || '',
+               existingImage: ecoverPreview && ecoverPreview.startsWith('data:image') ? ecoverPreview : undefined
+             })
+           });
+           const data = await response.json();
+           if (!response.ok) throw new Error(data.error || 'Generation failed');
+           if (data.imageData) { setEcoverPreview(data.imageData); }
+      } catch (e: any) { alert(e.message || "Generation failed."); } finally { setIsGeneratingEcover(false); }
   };
 
   const fileToGenerativePart = async (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onloadend = () => { const base64String = reader.result as string; const base64Data = base64String.split(',')[1]; resolve({ inlineData: { data: base64Data, mimeType: file.type } }); }; reader.onerror = reject; reader.readAsDataURL(file); }); };
@@ -447,17 +450,30 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
       if (!file && !ecoverFile && !ecoverPreview) { alert("Upload file or cover first."); return; }
       setIsAutoGeneratingDetails(target);
       try {
-          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-          const parts: any[] = [];
-          if (file) parts.push(await fileToGenerativePart(file));
-          if (ecoverFile) parts.push(await fileToGenerativePart(ecoverFile));
-          else if (ecoverPreview && ecoverPreview.startsWith('data:') && ecoverPreview.includes('base64')) { const base64 = ecoverPreview.split(',')[1]; parts.push({ inlineData: { data: base64, mimeType: 'image/png' } }); }
-          let prompt = target === 'headline' ? "Generate course headline (max 15 words). Return JSON: { \"text\": \"...\" }" : "Generate course description (50 words). Return JSON: { \"text\": \"...\" }";
-          parts.push({ text: prompt });
-          const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts }, config: { responseMimeType: "application/json" } }));
-          const json = JSON.parse(response.text || "{}");
-          if (json.text) { setCourseDetails(prev => ({ ...prev, [target]: json.text })); }
-      } catch (e) { alert(`Failed to generate ${target}.`); } finally { setIsAutoGeneratingDetails(null); }
+          // Convert file to base64 if present
+          let fileData: string | undefined;
+          let fileMimeType: string | undefined;
+          if (file) {
+            const filePart = await fileToGenerativePart(file);
+            fileData = filePart.inlineData.data;
+            fileMimeType = filePart.inlineData.mimeType;
+          } else if (ecoverFile) {
+            const filePart = await fileToGenerativePart(ecoverFile);
+            fileData = filePart.inlineData.data;
+            fileMimeType = filePart.inlineData.mimeType;
+          }
+          // Get cover data if available
+          const coverData = ecoverPreview && ecoverPreview.startsWith('data:') && ecoverPreview.includes('base64') ? ecoverPreview : undefined;
+          
+          const response = await fetch('/api/ai/generate-metadata', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target, fileData, fileMimeType, coverData })
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Generation failed');
+          if (data.text) { setCourseDetails(prev => ({ ...prev, [target]: data.text })); }
+      } catch (e: any) { alert(e.message || `Failed to generate ${target}.`); } finally { setIsAutoGeneratingDetails(null); }
   };
 
   const generateAudio = async (text: string, voiceId: string): Promise<{ audioData: string, mimeType: 'audio/pcm' | 'audio/mpeg', duration: number, wordTimestamps?: { word: string; start: number; end: number }[] } | null> => {
