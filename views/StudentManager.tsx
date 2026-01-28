@@ -406,7 +406,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({
             alert('Please select at least one student');
             return;
         }
-        if (!confirm(\`Send login credentials to \${selectedStudentIds.length} student(s)?\`)) {
+        if (!confirm(`Send login credentials to ${selectedStudentIds.length} student(s)?`)) {
             return;
         }
         setSendingCredentials(selectedStudentIds);
