@@ -2769,6 +2769,42 @@ app.get("/api/debug/test-email", async (req, res) => {
   }
 });
 
+// Debug endpoint to test sending to any email
+app.get("/api/debug/test-send/:email", async (req, res) => {
+  const resendKey = process.env.RESEND_API_KEY;
+  const toEmail = req.params.email;
+  
+  if (!resendKey) {
+    return res.json({ success: false, error: "RESEND_API_KEY not set" });
+  }
+  
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${resendKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: "Jobs on Demand Academy <onboarding@resend.dev>",
+        to: [toEmail],
+        subject: "Test Email from Jobs on Demand Academy",
+        html: "<h1>Email is working!</h1><p>This test email was sent to: " + toEmail + "</p>"
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (response.ok) {
+      res.json({ success: true, message: "Email sent to " + toEmail, id: data.id });
+    } else {
+      res.json({ success: false, error: data.message || "Unknown error", details: data });
+    }
+  } catch (error: any) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // Send login credentials to a student
 app.post("/api/students/send-credentials", async (req, res) => {
   try {
