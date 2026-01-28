@@ -47,7 +47,8 @@
     "ws": "^8.18.3",
     "zod": "^4.2.1",
     "zod-validation-error": "^5.0.0",
-    "cloudinary": "^2.0.0"
+    "cloudinary": "^2.0.0",
+    "nodemailer": "^6.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
