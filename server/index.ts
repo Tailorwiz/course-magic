@@ -2179,7 +2179,10 @@ app.post("/api/ai/generate-image", async (req, res) => {
       model: 'gemini-3-pro-image-preview',
       contents: { parts: [{ text: prompt }] },
       config: { 
-        responseModalities: ['TEXT', 'IMAGE']
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: {
+          aspectRatio: aspectRatio
+        }
       }
     });
     
