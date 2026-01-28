@@ -69,14 +69,14 @@ function ensureMediaDirs() {
 ensureMediaDirs();
 
 function isBase64Data(data: string): boolean {
-  if (!data || data.length < 100) return true;
-  if (data.startsWith('/media/') || data.startsWith('http')) return true;
-  if (data === '[IMAGE]' || data === '[AUDIO]' || data === '[VIDEO]') return true;
+  if (!data || data.length < 100) return false;
+  if (data.startsWith('/media/') || data.startsWith('http')) return false;
+  if (data === '[IMAGE]' || data === '[AUDIO]' || data === '[VIDEO]') return false;
   // Check if it looks like base64 (data URL or raw base64)
   if (data.startsWith('data:')) return true;
   // Raw base64 - check if it's mostly valid base64 chars and long enough
   if (/^[A-Za-z0-9+/=]+$/.test(data.slice(0, 100)) && data.length > 1000) return true;
-  return true;
+  return false;
 }
 
 function saveBase64ToFile(base64Data: string, type: 'images' | 'audio' | 'video', extension: string): string | null {
@@ -116,10 +116,11 @@ function saveBase64ToFile(base64Data: string, type: 'images' | 'audio' | 'video'
 let objectStorageWorking: boolean | null = null;
 
 async function isObjectStorageConfigured(): Promise<boolean> {
-  // Use Cloudinary for media storage
-  return true;
+  // DISABLED: Only use Supabase database for all storage
+  // Object Storage is not used - all media goes to lesson_audio and lesson_images tables
+  return false;
   
-  if (!process.env.PRIVATE_OBJECT_DIR) return true;
+  if (!process.env.PRIVATE_OBJECT_DIR) return false;
   
   // Cache the result after first check
   if (objectStorageWorking !== null) return objectStorageWorking;
@@ -2200,6 +2201,131 @@ app.post("/api/ai/generate-image", async (req, res) => {
     return res.status(500).json({ 
       error: 'Gemini image generation failed', 
       details: geminiError?.message 
+    });
+  }
+});
+
+
+// AI Cover Generation endpoint - generates book covers with Gemini
+app.post("/api/ai/generate-cover", async (req, res) => {
+  const { title, headline, instructions, existingImage } = req.body;
+  
+  if (!title) {
+    return res.status(400).json({ error: "Title is required" });
+  }
+  
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is required for cover generation.' });
+  }
+  
+  try {
+    console.log('Generating AI cover with Gemini...');
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    
+    const parts: any[] = [];
+    let isEditing = false;
+    
+    // If existing image provided, add it for editing
+    if (existingImage && existingImage.startsWith('data:image')) {
+      isEditing = true;
+      const base64Data = existingImage.split(',')[1];
+      const mimeType = existingImage.split(';')[0].split(':')[1];
+      parts.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+    }
+    
+    // Build prompt
+    let prompt = "";
+    if (isEditing) {
+      prompt = `TASK: Edit text on image. Replace Title with: "${title}". Replace Subtitle with: "${headline || ''}". Keep background/layout. USER OVERRIDES: "${instructions || ''}"`;
+    } else {
+      prompt = `Design book cover for "${title}". Headline: "${headline || ''}". STYLE: High-end corporate. USER INSTRUCTIONS: "${instructions || ''}"`;
+    }
+    parts.push({ text: prompt });
+    
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-image',
+      contents: { parts: parts },
+      config: { 
+        responseModalities: ['TEXT', 'IMAGE'], 
+        imageConfig: { aspectRatio: '2:3', imageSize: '1K' } 
+      }
+    });
+    
+    if (response.candidates?.[0]?.content?.parts) {
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData && part.inlineData.data) {
+          console.log('AI cover generated successfully');
+          return res.json({ 
+            imageData: `data:image/png;base64,${part.inlineData.data}`,
+            success: true 
+          });
+        }
+      }
+    }
+    throw new Error('No image data in Gemini response');
+  } catch (error: any) {
+    console.error('Cover generation failed:', error?.message);
+    return res.status(500).json({ 
+      error: 'Cover generation failed', 
+      details: error?.message 
+    });
+  }
+});
+
+// AI Metadata Generation endpoint - generates headlines/descriptions from files
+app.post("/api/ai/generate-metadata", async (req, res) => {
+  const { target, fileData, fileMimeType, coverData } = req.body;
+  
+  if (!target || (target !== 'headline' && target !== 'description')) {
+    return res.status(400).json({ error: "Target must be 'headline' or 'description'" });
+  }
+  
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is required.' });
+  }
+  
+  try {
+    console.log(`Generating ${target} with Gemini...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    
+    const parts: any[] = [];
+    
+    // Add file if provided
+    if (fileData && fileMimeType) {
+      parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
+    }
+    
+    // Add cover if provided
+    if (coverData) {
+      const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
+      parts.push({ inlineData: { data: base64, mimeType: 'image/png' } });
+    }
+    
+    if (parts.length === 0) {
+      return res.status(400).json({ error: "No file or cover data provided" });
+    }
+    
+    const prompt = target === 'headline' 
+      ? "Generate course headline (max 15 words). Return JSON: { \"text\": \"...\" }" 
+      : "Generate course description (50 words). Return JSON: { \"text\": \"...\" }";
+    parts.push({ text: prompt });
+    
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: { parts },
+      config: { responseMimeType: "application/json" }
+    });
+    
+    const json = JSON.parse(response.text || "{}");
+    console.log(`${target} generated successfully`);
+    return res.json({ text: json.text, success: true });
+  } catch (error: any) {
+    console.error(`Metadata generation failed:`, error?.message);
+    return res.status(500).json({ 
+      error: 'Metadata generation failed', 
+      details: error?.message 
     });
   }
 });
