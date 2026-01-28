@@ -2771,6 +2771,24 @@ app.get("/api/debug/test-email", async (req, res) => {
 
 
 
+
+
+// Debug endpoint to list ALL users
+app.get("/api/debug/list-all-users", async (req, res) => {
+  try {
+    const allUsers = await db.select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+      role: users.role
+    }).from(users).limit(20);
+    
+    res.json({ count: allUsers.length, users: allUsers });
+  } catch (error: any) {
+    res.json({ error: error?.message });
+  }
+});
+
 // Debug endpoint to list students
 app.get("/api/debug/list-students", async (req, res) => {
   try {
