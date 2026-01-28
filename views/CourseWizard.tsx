@@ -436,7 +436,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
            if (isEditing) { prompt = `TASK: Edit text on image. Replace Title with: "${courseDetails.title}". Replace Subtitle with: "${courseDetails.headline || ''}". Keep background/layout. USER OVERRIDES: "${ecoverInstructions}"`; } 
            else { prompt = `Design book cover for "${courseDetails.title}". Headline: "${courseDetails.headline || ''}". STYLE: High-end corporate. USER INSTRUCTIONS: "${ecoverInstructions}"`; }
            parts.push({ text: prompt });
-           const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts: parts }, config: { imageConfig: { aspectRatio: '2:3' } } }));
+           const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts: parts }, config: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: '2:3', imageSize: '1K' } } }));
            if (response.candidates?.[0]?.content?.parts) { for (const part of response.candidates[0].content.parts) { if (part.inlineData && part.inlineData.data) { setEcoverPreview(`data:image/png;base64,${part.inlineData.data}`); break; } } }
       } catch (e) { alert("Generation failed."); } finally { setIsGeneratingEcover(false); }
   };
