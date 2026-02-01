@@ -1341,20 +1341,9 @@ app.get("/api/courses", async (req, res) => {
       SELECT 
         id,
         created_at,
-        updated_at,
         data->>'id' as course_id,
         data->>'title' as title,
-        data->>'headline' as headline,
-        SUBSTRING(data->>'description', 1, 300) as description,
-        data->>'status' as status,
-        data->>'type' as course_type,
-        CASE 
-          WHEN data->>'ecoverUrl' IS NULL THEN ''
-          WHEN LENGTH(data->>'ecoverUrl') > 500 THEN ''
-          ELSE data->>'ecoverUrl'
-        END as ecover_url,
-        LENGTH(COALESCE(data->>'ecoverUrl', '')) > 500 as has_cover_in_db,
-        COALESCE(jsonb_array_length(data->'modules'), 0) as module_count
+        data->>'status' as status
       FROM courses
       ORDER BY created_at DESC
     `);
