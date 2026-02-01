@@ -14,7 +14,7 @@ import multer from "multer";
 import JSZip from "jszip";
 import { db } from "./db";
 import { users, courses, progress, tickets, certificates, lessonAudio, lessonImages } from "../shared/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
 
@@ -1347,8 +1347,19 @@ app.get("/api/courses", async (req, res) => {
   const fetchCourses = async (attempt = 1): Promise<any[]> => {
     try {
       console.log(`Querying courses (attempt ${attempt})...`);
-      const allCourses = await db.select().from(courses);
-      console.log("Courses query returned:", allCourses.length, "courses");
+      // Only select id and timestamps - extract needed fields from data via raw SQL
+      const result = await db.execute(
+        sql`SELECT id, 
+            data->>'title' as title, 
+            data->>'thumbnail_url' as thumbnail_url,
+            data->>'creatorId' as "creatorId",
+            data->>'isPublished' as "isPublished",
+            created_at, 
+            updated_at 
+        FROM courses`
+      );
+      const allCourses = result.rows || result;
+      console.log("Courses query returned:", allCourses.length, "courses (lightweight)");
       return allCourses;
     } catch (error: any) {
       console.error(`Get courses error (attempt ${attempt}):`, error?.message || error);
