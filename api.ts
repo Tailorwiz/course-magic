@@ -261,8 +261,13 @@ export const api = {
 
   courses: {
     async getAll(): Promise<Course[]> {
-      const res = await fetch(`${API_BASE}/courses`);
-      return handleResponse<Course[]>(res);
+      const res = await fetch(`${API_BASE}/courses?limit=50`);
+      const data = await handleResponse<{courses: Course[], pagination: any} | Course[]>(res);
+      // Handle both paginated and legacy response formats
+      if (Array.isArray(data)) {
+        return data;
+      }
+      return data.courses || [];
     },
     async get(id: string): Promise<Course> {
       const res = await fetch(`${API_BASE}/courses/${id}`);
