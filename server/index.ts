@@ -14,7 +14,7 @@ import multer from "multer";
 import JSZip from "jszip";
 import { db } from "./db";
 import { users, courses, progress, tickets, certificates, lessonAudio, lessonImages } from "../shared/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
 
@@ -1347,9 +1347,7 @@ app.get("/api/courses", async (req, res) => {
   const fetchCourses = async (attempt = 1): Promise<any[]> => {
     try {
       console.log(`Querying courses (attempt ${attempt})...`);
-      const result = await db.execute(sql`SELECT id, data->>'title' as title, data->>'thumbnail_url' as thumbnail_url, data->>'creatorId' as creator_id, data->>'isPublished' as is_published FROM courses`);
-      const rows: any[] = (result as any).rows || result;
-      const allCourses = rows.map((r: any) => ({ id: r.id, title: r.title, thumbnail_url: r.thumbnail_url, creatorId: r.creator_id, isPublished: r.is_published === 'true' }));
+      const allCourses = await db.select().from(courses);
       console.log("Courses query returned:", allCourses.length, "courses");
       return allCourses;
     } catch (error: any) {
@@ -1548,9 +1546,7 @@ app.delete("/api/courses/:id", async (req, res) => {
 app.get("/api/courses/export-all", async (req, res) => {
   try {
     console.log("Starting server-side export of all courses...");
-    const result = await db.execute(sql`SELECT id, data->>'title' as title, data->>'thumbnail_url' as thumbnail_url, data->>'creatorId' as creator_id, data->>'isPublished' as is_published FROM courses`);
-      const rows: any[] = (result as any).rows || result;
-      const allCourses = rows.map((r: any) => ({ id: r.id, title: r.title, thumbnail_url: r.thumbnail_url, creatorId: r.creator_id, isPublished: r.is_published === 'true' }));
+    const allCourses = await db.select().from(courses);
     
     if (allCourses.length === 0) {
       return res.status(404).json({ error: "No courses to export" });
@@ -2021,9 +2017,7 @@ app.post("/api/migrate-media", async (req, res) => {
   
   try {
     console.log("Starting media migration...");
-    const result = await db.execute(sql`SELECT id, data->>'title' as title, data->>'thumbnail_url' as thumbnail_url, data->>'creatorId' as creator_id, data->>'isPublished' as is_published FROM courses`);
-      const rows: any[] = (result as any).rows || result;
-      const allCourses = rows.map((r: any) => ({ id: r.id, title: r.title, thumbnail_url: r.thumbnail_url, creatorId: r.creator_id, isPublished: r.is_published === 'true' }));
+    const allCourses = await db.select().from(courses);
     let migratedCount = 0;
     let errorCount = 0;
     const results: any[] = [];
@@ -2117,9 +2111,7 @@ app.post("/api/migrate-media/:id", async (req, res) => {
 // List courses that need migration
 app.get("/api/migrate-media/pending", async (req, res) => {
   try {
-    const result = await db.execute(sql`SELECT id, data->>'title' as title, data->>'thumbnail_url' as thumbnail_url, data->>'creatorId' as creator_id, data->>'isPublished' as is_published FROM courses`);
-      const rows: any[] = (result as any).rows || result;
-      const allCourses = rows.map((r: any) => ({ id: r.id, title: r.title, thumbnail_url: r.thumbnail_url, creatorId: r.creator_id, isPublished: r.is_published === 'true' }));
+    const allCourses = await db.select().from(courses);
     const pending: any[] = [];
     
     for (const course of allCourses) {
