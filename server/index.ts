@@ -1327,75 +1327,127 @@ app.delete("/api/users/:id", async (req, res) => {
 // ============ COURSES ROUTES ============
 
 app.get("/api/courses", async (req, res) => {
-  // Prevent caching
+  // Prevent caching - always return fresh data
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
   
-  // Ultra-low limit to prevent memory crashes on 512MB Railway
-  const page = Math.max(1, parseInt(req.query.page as string) || 1);
-  const limit = Math.min(5, Math.max(1, parseInt(req.query.limit as string) || 5)); // MAX 5
-  const offset = (page - 1) * limit;
+  console.log("GET /api/courses - Starting request");
   
-  console.log(`GET /api/courses - Page ${page}, Limit ${limit}, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+  const isConnectionError = (error: any): boolean => {
+    const msg = error?.message || '';
+    const code = error?.code || '';
+    const causeMsg = error?.cause?.message || '';
+    const causeCode = error?.cause?.code || '';
+    return msg.includes('CONNECTION') || code.includes('CONNECTION') || 
+           causeMsg.includes('CONNECTION') || causeCode.includes('CONNECTION') ||
+           msg.includes('57P02') || code === '57P02';
+  };
+  
+  const fetchCourses = async (attempt = 1): Promise<any[]> => {
+    try {
+      console.log(`Querying courses (attempt ${attempt})...`);
+      const allCourses = await db.select().from(courses);
+      console.log("Courses query returned:", allCourses.length, "courses");
+      return allCourses;
+    } catch (error: any) {
+      console.error(`Get courses error (attempt ${attempt}):`, error?.message || error);
+      if (attempt < 4 && isConnectionError(error)) {
+        console.log("Connection error detected, reconnecting to database...");
+        const { reconnectDb } = await import('./db');
+        await reconnectDb();
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        return fetchCourses(attempt + 1);
+      }
+      throw error;
+    }
+  };
   
   try {
-    // Get count first
-    const countResult = await db.select({ count: sql\`count(*)\` }).from(courses);
-    const total = Number(countResult[0]?.count || 0);
-    console.log(`Total courses in DB: ${total}`);
-    
-    // Fetch minimal page
-    const pageCourses = await db.select().from(courses).limit(limit).offset(offset);
-    console.log(`Fetched ${pageCourses.length} courses, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
-    
-    // Process one at a time to minimize memory
+    const allCourses = await fetchCourses();
+    // Return MINIMAL summaries - courses can be 8MB+ each with embedded media
     const coursesData: any[] = [];
-    for (let i = 0; i < pageCourses.length; i++) {
-      const c = pageCourses[i];
+    
+    for (const c of allCourses) {
       try {
-        const data = c.data as any;
-        if (!data) continue;
+        if (c.data == null) continue;
         
-        // Extract ONLY what we need - no module/lesson details in list view
+        const data = c.data as any;
+        if (!data || typeof data !== 'object') {
+          coursesData.push({
+            id: c.id,
+            title: 'Untitled Course',
+            headline: '',
+            description: '',
+            ecoverUrl: '',
+            status: 'DRAFT',
+            type: 'course',
+            modules: [],
+            totalStudents: 0,
+            rating: 0,
+            _dbId: c.id,
+            _hasFullData: false,
+          });
+          continue;
+        }
+        
+        // Create LIGHTWEIGHT module/lesson structure - NO binary data at all
+        const lightModules = (data.modules || []).map((m: any) => ({
+          id: m.id,
+          title: m.title,
+          lessons: (m.lessons || []).map((l: any) => ({
+            id: l.id,
+            title: l.title,
+            status: l.status,
+            voice: l.voice,
+            duration: l.duration,
+            hostedVideoUrl: l.hostedVideoUrl,
+            videoUrl: l.videoUrl,
+            countsTowardCertificate: l.countsTowardCertificate,
+            // Only indicate if visuals exist, don't include data
+            visualCount: (l.visuals || []).length,
+            hasAudio: !!(l.audioData && l.audioData.length > 100),
+            hasAudioInDb: l.hasAudioInDb === true,
+            hasImagesInDb: l.hasImagesInDb === true,
+            hasRenderedVideo: !!l.renderedVideoUrl,
+            renderedVideoUrl: l.renderedVideoUrl,
+          })),
+        }));
+        
+        // Return only essential fields - NO large data
+        // For covers: include URL if it's a URL, otherwise flag that cover exists in DB
         const coverUrl = data.ecoverUrl || '';
-        const isBase64Cover = coverUrl.startsWith('data:') || coverUrl.length > 1000;
+        const hasCoverInDb = coverUrl.startsWith('data:') || coverUrl.length > 1000;
+        const safeEcoverUrl = hasCoverInDb ? '' : coverUrl;
         
         coursesData.push({
           id: data.id || c.id,
           type: data.type || 'course',
           title: data.title || 'Untitled',
-          headline: (data.headline || '').substring(0, 200),
-          description: (data.description || '').substring(0, 300),
-          ecoverUrl: isBase64Cover ? '' : coverUrl,
-          hasCover: !!coverUrl,
-          hasCoverInDb: isBase64Cover,
+          headline: data.headline || '',
+          description: (data.description || '').substring(0, 500), // Limit description
+          ecoverUrl: safeEcoverUrl,
+          hasCover: hasCoverInDb || !!safeEcoverUrl, // Flag for lazy loading
+          hasCoverInDb: hasCoverInDb, // Flag to fetch cover from database endpoint
           status: data.status || 'DRAFT',
           totalStudents: data.totalStudents || 0,
           rating: data.rating || 0,
-          moduleCount: (data.modules || []).length,
-          lessonCount: (data.modules || []).reduce((sum: number, m: any) => sum + (m.lessons || []).length, 0),
-          modules: [], // Empty - fetch details separately via /api/courses/:id
+          modules: lightModules,
           _dbId: c.id,
           _hasFullData: false,
           createdAt: c.createdAt,
           updatedAt: c.updatedAt,
         });
-      } catch (err: any) {
-        console.error("Error processing course", c.id);
+      } catch (courseErr: any) {
+        console.error("Error processing course", c.id, ":", courseErr?.message);
       }
-      // Clear reference to allow GC
-      (pageCourses as any)[i] = null;
     }
     
-    console.log(`Returning ${coursesData.length} courses, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
-    
-    res.json({
-      courses: coursesData,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit), hasMore: page * limit < total }
-    });
+    const responseSize = JSON.stringify(coursesData).length;
+    console.log("Returning", coursesData.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
+    res.json(coursesData);
   } catch (error: any) {
-    console.error("Get courses failed:", error?.message);
+    console.error("Get courses failed after retries:", error?.message || error);
     res.status(500).json({ error: "Failed to get courses" });
   }
 });
@@ -2717,41 +2769,6 @@ app.get("/api/debug/test-email", async (req, res) => {
   }
 });
 
-
-
-
-
-// Debug endpoint to list ALL users
-app.get("/api/debug/list-all-users", async (req, res) => {
-  try {
-    const allUsers = await db.select({
-      id: users.id,
-      name: users.name,
-      email: users.email,
-      role: users.role
-    }).from(users).limit(20);
-    
-    res.json({ count: allUsers.length, users: allUsers });
-  } catch (error: any) {
-    res.json({ error: error?.message });
-  }
-});
-
-// Debug endpoint to list students
-app.get("/api/debug/list-students", async (req, res) => {
-  try {
-    const students = await db.select({
-      id: users.id,
-      name: users.name,
-      email: users.email
-    }).from(users).where(eq(users.role, 'student')).limit(10);
-    
-    res.json({ count: students.length, students });
-  } catch (error: any) {
-    res.json({ error: error?.message });
-  }
-});
-
 // Debug endpoint to test sending to any email
 app.get("/api/debug/test-send/:email", async (req, res) => {
   const resendKey = process.env.RESEND_API_KEY;
@@ -2789,9 +2806,55 @@ app.get("/api/debug/test-send/:email", async (req, res) => {
 });
 
 // Send login credentials to a student
+
+
+// Debug endpoint to test sending credentials to a specific student ID
+app.get("/api/debug/test-student/:id", async (req, res) => {
+  try {
+    const studentId = req.params.id;
+    console.log('[DEBUG] Testing student ID:', studentId);
+    
+    const resendKey = process.env.RESEND_API_KEY;
+    if (!resendKey) {
+      return res.status(500).json({ error: "RESEND_API_KEY not set" });
+    }
+    
+    // Look up student
+    const [student] = await db.select().from(users).where(eq(users.id, studentId));
+    
+    if (!student) {
+      return res.json({ error: "Student not found", studentId });
+    }
+    
+    if (!student.email) {
+      return res.json({ error: "Student has no email", studentId, student: { id: student.id, name: student.name } });
+    }
+    
+    // Try to send
+    const loginUrl = 'https://www.jobsondemandacademy.com/login';
+    const emailHtml = `<p>Test credentials email for ${student.name || 'Student'}</p><p>Email: ${student.email}</p>`;
+    
+    const result = await sendEmailWithResend(student.email, 'Test Credentials Email', emailHtml);
+    
+    res.json({ 
+      success: true, 
+      message: "Email sent!", 
+      id: result.id,
+      student: { id: student.id, name: student.name, email: student.email }
+    });
+    
+  } catch (error: any) {
+    console.error('[DEBUG] Error:', error);
+    res.json({ error: error?.message || 'Unknown error', stack: error?.stack });
+  }
+});
+
+// Send credentials endpoint
 app.post("/api/students/send-credentials", async (req, res) => {
+  console.log('[SEND-CREDENTIALS] Request received:', JSON.stringify(req.body));
   try {
     const { studentId, studentIds } = req.body;
+    console.log('[SEND-CREDENTIALS] studentId:', studentId, 'studentIds:', studentIds);
     
     // Handle both single and bulk requests
     const idsToProcess = studentIds || (studentId ? [studentId] : []);
@@ -2810,7 +2873,9 @@ app.post("/api/students/send-credentials", async (req, res) => {
     
     for (const id of idsToProcess) {
       try {
+        console.log('[SEND-CREDENTIALS] Looking up student ID:', id);
         const [student] = await db.select().from(users).where(eq(users.id, id));
+        console.log('[SEND-CREDENTIALS] Found student:', student ? student.email : 'NOT FOUND');
         
         if (!student) {
           results.push({ studentId: id, email: '', success: false, error: 'Student not found' });
@@ -2867,7 +2932,7 @@ app.post("/api/students/send-credentials", async (req, res) => {
         results.push({ studentId: id, email: student.email, success: true });
         
       } catch (emailError: any) {
-        console.error('[EMAIL] Error sending to student', id, ':', emailError);
+        console.error('[EMAIL] Error sending to student', id, ':', emailError?.message, emailError?.stack);
         results.push({ studentId: id, email: '', success: false, error: emailError?.message || 'Failed to send' });
       }
     }
