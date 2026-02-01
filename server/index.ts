@@ -1327,147 +1327,75 @@ app.delete("/api/users/:id", async (req, res) => {
 // ============ COURSES ROUTES ============
 
 app.get("/api/courses", async (req, res) => {
-  // Prevent caching - always return fresh data
+  // Prevent caching
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
   
-  // Pagination params - default 10 per page to prevent memory crashes
+  // Ultra-low limit to prevent memory crashes on 512MB Railway
   const page = Math.max(1, parseInt(req.query.page as string) || 1);
-  const limit = Math.min(20, Math.max(1, parseInt(req.query.limit as string) || 10));
+  const limit = Math.min(5, Math.max(1, parseInt(req.query.limit as string) || 5)); // MAX 5
   const offset = (page - 1) * limit;
   
-  console.log(`GET /api/courses - Page ${page}, Limit ${limit}`);
-  
-  const isConnectionError = (error: any): boolean => {
-    const msg = error?.message || '';
-    const code = error?.code || '';
-    const causeMsg = error?.cause?.message || '';
-    const causeCode = error?.cause?.code || '';
-    return msg.includes('CONNECTION') || code.includes('CONNECTION') || 
-           causeMsg.includes('CONNECTION') || causeCode.includes('CONNECTION') ||
-           msg.includes('57P02') || code === '57P02';
-  };
-  
-  const fetchCourses = async (attempt = 1): Promise<{courses: any[], total: number}> => {
-    try {
-      console.log(`Querying courses (attempt ${attempt})...`);
-      // Get total count first (lightweight query)
-      const countResult = await db.select({ count: sql\`count(*)\` }).from(courses);
-      const total = Number(countResult[0]?.count || 0);
-      
-      // Then fetch only the page we need
-      const pageCourses = await db.select().from(courses).limit(limit).offset(offset);
-      console.log(`Courses query returned: ${pageCourses.length} of ${total} courses (page ${page})`);
-      return { courses: pageCourses, total };
-    } catch (error: any) {
-      console.error(\`Get courses error (attempt \${attempt}):\`, error?.message || error);
-      if (attempt < 4 && isConnectionError(error)) {
-        console.log("Connection error detected, reconnecting to database...");
-        const { reconnectDb } = await import('./db');
-        await reconnectDb();
-        await new Promise(r => setTimeout(r, 1000 * attempt));
-        return fetchCourses(attempt + 1);
-      }
-      throw error;
-    }
-  };
+  console.log(`GET /api/courses - Page ${page}, Limit ${limit}, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
   
   try {
-    const { courses: allCourses, total } = await fetchCourses();
-    // Return MINIMAL summaries - courses can be 8MB+ each with embedded media
-    const coursesData: any[] = [];
+    // Get count first
+    const countResult = await db.select({ count: sql\`count(*)\` }).from(courses);
+    const total = Number(countResult[0]?.count || 0);
+    console.log(`Total courses in DB: ${total}`);
     
-    for (const c of allCourses) {
+    // Fetch minimal page
+    const pageCourses = await db.select().from(courses).limit(limit).offset(offset);
+    console.log(`Fetched ${pageCourses.length} courses, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+    
+    // Process one at a time to minimize memory
+    const coursesData: any[] = [];
+    for (let i = 0; i < pageCourses.length; i++) {
+      const c = pageCourses[i];
       try {
-        if (c.data == null) continue;
-        
         const data = c.data as any;
-        if (!data || typeof data !== 'object') {
-          coursesData.push({
-            id: c.id,
-            title: 'Untitled Course',
-            headline: '',
-            description: '',
-            ecoverUrl: '',
-            status: 'DRAFT',
-            type: 'course',
-            modules: [],
-            totalStudents: 0,
-            rating: 0,
-            _dbId: c.id,
-            _hasFullData: false,
-          });
-          continue;
-        }
+        if (!data) continue;
         
-        // Create LIGHTWEIGHT module/lesson structure - NO binary data at all
-        const lightModules = (data.modules || []).map((m: any) => ({
-          id: m.id,
-          title: m.title,
-          lessons: (m.lessons || []).map((l: any) => ({
-            id: l.id,
-            title: l.title,
-            status: l.status,
-            voice: l.voice,
-            duration: l.duration,
-            hostedVideoUrl: l.hostedVideoUrl,
-            videoUrl: l.videoUrl,
-            countsTowardCertificate: l.countsTowardCertificate,
-            // Only indicate if visuals exist, don't include data
-            visualCount: (l.visuals || []).length,
-            hasAudio: !!(l.audioData && l.audioData.length > 100),
-            hasAudioInDb: l.hasAudioInDb === true,
-            hasImagesInDb: l.hasImagesInDb === true,
-            hasRenderedVideo: !!l.renderedVideoUrl,
-            renderedVideoUrl: l.renderedVideoUrl,
-          })),
-        }));
-        
-        // Return only essential fields - NO large data
-        // For covers: include URL if it's a URL, otherwise flag that cover exists in DB
+        // Extract ONLY what we need - no module/lesson details in list view
         const coverUrl = data.ecoverUrl || '';
-        const hasCoverInDb = coverUrl.startsWith('data:') || coverUrl.length > 1000;
-        const safeEcoverUrl = hasCoverInDb ? '' : coverUrl;
+        const isBase64Cover = coverUrl.startsWith('data:') || coverUrl.length > 1000;
         
         coursesData.push({
           id: data.id || c.id,
           type: data.type || 'course',
           title: data.title || 'Untitled',
-          headline: data.headline || '',
-          description: (data.description || '').substring(0, 500), // Limit description
-          ecoverUrl: safeEcoverUrl,
-          hasCover: hasCoverInDb || !!safeEcoverUrl, // Flag for lazy loading
-          hasCoverInDb: hasCoverInDb, // Flag to fetch cover from database endpoint
+          headline: (data.headline || '').substring(0, 200),
+          description: (data.description || '').substring(0, 300),
+          ecoverUrl: isBase64Cover ? '' : coverUrl,
+          hasCover: !!coverUrl,
+          hasCoverInDb: isBase64Cover,
           status: data.status || 'DRAFT',
           totalStudents: data.totalStudents || 0,
           rating: data.rating || 0,
-          modules: lightModules,
+          moduleCount: (data.modules || []).length,
+          lessonCount: (data.modules || []).reduce((sum: number, m: any) => sum + (m.lessons || []).length, 0),
+          modules: [], // Empty - fetch details separately via /api/courses/:id
           _dbId: c.id,
           _hasFullData: false,
           createdAt: c.createdAt,
           updatedAt: c.updatedAt,
         });
-      } catch (courseErr: any) {
-        console.error("Error processing course", c.id, ":", courseErr?.message);
+      } catch (err: any) {
+        console.error("Error processing course", c.id);
       }
+      // Clear reference to allow GC
+      (pageCourses as any)[i] = null;
     }
     
-    const responseSize = JSON.stringify(coursesData).length;
-    console.log("Returning", coursesData.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
-    // Return with pagination metadata
+    console.log(`Returning ${coursesData.length} courses, Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+    
     res.json({
       courses: coursesData,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasMore: page * limit < total
-      }
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit), hasMore: page * limit < total }
     });
   } catch (error: any) {
-    console.error("Get courses failed after retries:", error?.message || error);
+    console.error("Get courses failed:", error?.message);
     res.status(500).json({ error: "Failed to get courses" });
   }
 });
