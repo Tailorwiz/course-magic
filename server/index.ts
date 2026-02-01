@@ -1332,7 +1332,12 @@ app.get("/api/courses", async (req, res) => {
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
   
-  console.log("GET /api/courses - Starting request");
+  // Pagination params - default 10 per page to prevent memory crashes
+  const page = Math.max(1, parseInt(req.query.page as string) || 1);
+  const limit = Math.min(20, Math.max(1, parseInt(req.query.limit as string) || 10));
+  const offset = (page - 1) * limit;
+  
+  console.log(`GET /api/courses - Page ${page}, Limit ${limit}`);
   
   const isConnectionError = (error: any): boolean => {
     const msg = error?.message || '';
@@ -1344,14 +1349,19 @@ app.get("/api/courses", async (req, res) => {
            msg.includes('57P02') || code === '57P02';
   };
   
-  const fetchCourses = async (attempt = 1): Promise<any[]> => {
+  const fetchCourses = async (attempt = 1): Promise<{courses: any[], total: number}> => {
     try {
       console.log(`Querying courses (attempt ${attempt})...`);
-      const allCourses = await db.select().from(courses);
-      console.log("Courses query returned:", allCourses.length, "courses");
-      return allCourses;
+      // Get total count first (lightweight query)
+      const countResult = await db.select({ count: sql\`count(*)\` }).from(courses);
+      const total = Number(countResult[0]?.count || 0);
+      
+      // Then fetch only the page we need
+      const pageCourses = await db.select().from(courses).limit(limit).offset(offset);
+      console.log(`Courses query returned: ${pageCourses.length} of ${total} courses (page ${page})`);
+      return { courses: pageCourses, total };
     } catch (error: any) {
-      console.error(`Get courses error (attempt ${attempt}):`, error?.message || error);
+      console.error(\`Get courses error (attempt \${attempt}):\`, error?.message || error);
       if (attempt < 4 && isConnectionError(error)) {
         console.log("Connection error detected, reconnecting to database...");
         const { reconnectDb } = await import('./db');
@@ -1364,7 +1374,7 @@ app.get("/api/courses", async (req, res) => {
   };
   
   try {
-    const allCourses = await fetchCourses();
+    const { courses: allCourses, total } = await fetchCourses();
     // Return MINIMAL summaries - courses can be 8MB+ each with embedded media
     const coursesData: any[] = [];
     
@@ -1445,7 +1455,17 @@ app.get("/api/courses", async (req, res) => {
     
     const responseSize = JSON.stringify(coursesData).length;
     console.log("Returning", coursesData.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
-    res.json(coursesData);
+    // Return with pagination metadata
+    res.json({
+      courses: coursesData,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page * limit < total
+      }
+    });
   } catch (error: any) {
     console.error("Get courses failed after retries:", error?.message || error);
     res.status(500).json({ error: "Failed to get courses" });
