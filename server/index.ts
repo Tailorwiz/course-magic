@@ -14,7 +14,7 @@ import multer from "multer";
 import JSZip from "jszip";
 import { db } from "./db";
 import { users, courses, progress, tickets, certificates, lessonAudio, lessonImages } from "../shared/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
 
@@ -1347,32 +1347,9 @@ app.get("/api/courses", async (req, res) => {
   const fetchCourses = async (attempt = 1): Promise<any[]> => {
     try {
       console.log(`Querying courses (attempt ${attempt})...`);
-      // OPTIMIZATION: Only extract the fields needed for the course list
-      // This prevents loading the massive lesson data for every page view
-      const result = await db.execute(
-        sql`SELECT id, created_at, updated_at,
-            data->>'title' as title,
-            data->>'thumbnail_url' as thumbnail_url,
-            data->>'ecoverUrl' as ecover_url,
-            data->>'creatorId' as creator_id,
-            data->>'isPublished' as is_published
-            FROM courses`
-      );
-      const rows = (result as any).rows || result || [];
-      console.log("Courses query returned:", rows.length, "courses");
-      // Map to expected format
-      return rows.map((row: any) => ({
-        id: row.id,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        data: {
-          title: row.title || 'Untitled',
-          thumbnail_url: row.thumbnail_url,
-          ecoverUrl: row.ecover_url,
-          creatorId: row.creator_id,
-          isPublished: row.is_published === 'true' || row.is_published === true
-        }
-      }));
+      const allCourses = await db.select().from(courses);
+      console.log("Courses query returned:", allCourses.length, "courses");
+      return allCourses;
     } catch (error: any) {
       console.error(`Get courses error (attempt ${attempt}):`, error?.message || error);
       if (attempt < 4 && isConnectionError(error)) {
@@ -2756,6 +2733,26 @@ app.get("/api/debug/smtp-status", async (req, res) => {
     resend_api_key_set: !!resendKey,
     resend_api_key_prefix: resendKey ? resendKey.substring(0, 10) + '***' : null,
   });
+  // Debug: Test raw database query
+  app.get("/api/debug/test-db", async (req, res) => {
+    try {
+      console.log("Testing raw database query...");
+      const result = await db.execute(sql`SELECT COUNT(*) as count FROM courses`);
+      const rows = (result as any).rows || result || [];
+      console.log("DB test result:", rows);
+      res.json({ success: true, result: rows });
+    } catch (error: any) {
+      console.error("DB test error:", error);
+      res.json({ 
+        success: false, 
+        error: error?.message || String(error),
+        code: error?.code,
+        detail: error?.detail
+      });
+    }
+  });
+
+
 });
 
 // Test email endpoint using Resend
