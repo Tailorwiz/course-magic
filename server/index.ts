@@ -2733,26 +2733,6 @@ app.get("/api/debug/smtp-status", async (req, res) => {
     resend_api_key_set: !!resendKey,
     resend_api_key_prefix: resendKey ? resendKey.substring(0, 10) + '***' : null,
   });
-  // Debug: Test raw database query
-  app.get("/api/debug/test-db", async (req, res) => {
-    try {
-      console.log("Testing raw database query...");
-      const result = await db.execute(sql`SELECT COUNT(*) as count FROM courses`);
-      const rows = (result as any).rows || result || [];
-      console.log("DB test result:", rows);
-      res.json({ success: true, result: rows });
-    } catch (error: any) {
-      console.error("DB test error:", error);
-      res.json({ 
-        success: false, 
-        error: error?.message || String(error),
-        code: error?.code,
-        detail: error?.detail
-      });
-    }
-  });
-
-
 });
 
 // Test email endpoint using Resend
