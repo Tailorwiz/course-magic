@@ -1410,7 +1410,7 @@ app.get("/api/courses", async (req, res) => {
             hasAudioInDb: l.hasAudioInDb === true,
             hasImagesInDb: l.hasImagesInDb === true,
             hasRenderedVideo: !!l.renderedVideoUrl,
-            renderedVideoUrl: l.renderedVideoUrl,
+            // renderedVideoUrl removed - too large for listing (use course detail endpoint)
           })),
         }));
         
