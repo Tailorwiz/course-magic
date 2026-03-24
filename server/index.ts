@@ -1443,9 +1443,16 @@ app.get("/api/courses", async (req, res) => {
       }
     }
     
-    const responseSize = JSON.stringify(coursesData).length;
-    console.log("Returning", coursesData.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
-    res.json(coursesData);
+    // CRITICAL: Strip any remaining base64 blobs that may leak through
+    const sanitized = JSON.parse(JSON.stringify(coursesData, (key, value) => {
+      if (typeof value === 'string' && value.length > 50000 && (value.startsWith('data:') || value.startsWith('AAAA'))) {
+        return undefined; // Strip large base64 data
+      }
+      return value;
+    }));
+    const responseSize = JSON.stringify(sanitized).length;
+    console.log("Returning", sanitized.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
+    res.json(sanitized);
   } catch (error: any) {
     console.error("Get courses failed after retries:", error?.message || error);
     res.status(500).json({ error: "Failed to get courses" });
