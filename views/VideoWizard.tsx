@@ -2229,6 +2229,19 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
     const lesson = { ...finalCourse.modules[partIndex].lessons[0] };
     if (!lesson.audioData) { alert("No audio data found. Cannot render video."); return; }
     
+    // Merge hydrated images from videoParts into lesson visuals
+    // finalCourse may have been loaded from DB without imageData,
+    // but videoParts has been hydrated with actual image data from the DB
+    if (videoParts[partIndex]?.visuals && lesson.visuals) {
+      lesson.visuals = lesson.visuals.map((v: any, i: number) => {
+        const hydratedVisual = videoParts[partIndex].visuals[i];
+        if (!v.imageData && hydratedVisual?.imageData) {
+          return { ...v, imageData: hydratedVisual.imageData };
+        }
+        return v;
+      });
+    }
+    
     lesson.captionStyle = selectedCaptionStyle;
     lesson.captionPosition = captionPosition;
     lesson.captionSize = captionSize;
