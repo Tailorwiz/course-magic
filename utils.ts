@@ -159,7 +159,7 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
         let audioBuffer: AudioBuffer;
 
         // Handle audio: URL, data URL, or raw base64
-        if (lesson.audioData.startsWith('/media/') || lesson.audioData.startsWith('/objects/') || lesson.audioData.startsWith('http')) {
+        if (lesson.audioData.startsWith('/media/') || lesson.audioData.startsWith('/objects/') || lesson.audioData.startsWith('http') || lesson.audioData.startsWith('blob:')) {
             const response = await fetch(lesson.audioData);
             const arrayBuffer = await response.arrayBuffer();
             audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
