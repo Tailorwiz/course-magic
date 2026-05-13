@@ -2976,92 +2976,59 @@ app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
   }
 
   const geminiKey = process.env.GEMINI_API_KEY;
-  const openaiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
-
-  if (!geminiKey && !openaiKey) {
-    return res.status(500).json({ error: 'No image-gen API key configured (GEMINI_API_KEY or OPENAI_API_KEY).' });
+  if (!geminiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is required for image generation.' });
   }
 
-  // Try Gemini first if we have a key for it.
-  let geminiError: any = null;
-  if (geminiKey) {
-    try {
-      console.log('Generating image with Gemini 3 Pro...');
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
-        contents: { parts: [{ text: prompt }] },
-        config: {
-          responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: { aspectRatio: aspectRatio },
-        },
-      });
-      if (response.candidates?.[0]?.content?.parts) {
-        for (const part of response.candidates[0].content.parts) {
-          if (part.inlineData?.data) {
-            console.log('Gemini image generated successfully');
-            return res.json({ imageData: part.inlineData.data, provider: 'gemini', success: true });
-          }
+  // Try the premium Gemini 3 Pro Image model first (best quality, lowest daily quota).
+  // On rate-limit (429 / RESOURCE_EXHAUSTED), automatically fall back to the higher-quota
+  // Gemini 2.5 Flash Image model — same Gemini family, same provider, just more headroom.
+  const tryModel = async (model: string, label: string) => {
+    console.log(`Generating image with ${label} (${model})...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const response = await ai.models.generateContent({
+      model,
+      contents: { parts: [{ text: prompt }] },
+      config: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: { aspectRatio: aspectRatio },
+      },
+    });
+    if (response.candidates?.[0]?.content?.parts) {
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData?.data) {
+          return part.inlineData.data;
         }
       }
-      throw new Error('No image data in Gemini response');
-    } catch (err: any) {
-      geminiError = err;
-      const msg = String(err?.message || err);
-      const is429 = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-      console.error(`Gemini image gen failed${is429 ? ' (rate-limited)' : ''}, trying OpenAI fallback:`, msg.slice(0, 200));
     }
+    throw new Error(`No image data in ${label} response`);
+  };
+
+  let firstError: any = null;
+  try {
+    const data = await tryModel('gemini-3-pro-image-preview', 'Gemini 3 Pro');
+    console.log('Gemini 3 Pro image generated successfully');
+    return res.json({ imageData: data, provider: 'gemini-3-pro', success: true });
+  } catch (err: any) {
+    firstError = err;
+    const msg = String(err?.message || err);
+    const isRate = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('exceeded');
+    console.warn(`Gemini 3 Pro failed${isRate ? ' (rate-limited)' : ''}, trying Gemini 2.5 Flash Image:`, msg.slice(0, 200));
   }
 
-  // Fall back to OpenAI DALL-E if we have a key.
-  if (openaiKey) {
-    try {
-      // Map aspect ratio to closest DALL-E 3 supported size.
-      const ratio = String(aspectRatio || '16:9');
-      let size = '1024x1024';
-      if (ratio === '16:9' || ratio === '4:3') size = '1792x1024';
-      else if (ratio === '9:16' || ratio === '3:4' || ratio === '2:3') size = '1024x1792';
-
-      console.log(`Generating image with OpenAI DALL-E 3 (size=${size}) as Gemini fallback...`);
-      const resp = await fetch('https://api.openai.com/v1/images/generations', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'dall-e-3',
-          prompt,
-          n: 1,
-          size,
-          response_format: 'b64_json',
-          quality: 'standard',
-        }),
-      });
-
-      if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
-        throw new Error(`OpenAI ${resp.status}: ${errBody.slice(0, 300)}`);
-      }
-
-      const data = await resp.json() as any;
-      const b64 = data?.data?.[0]?.b64_json;
-      if (!b64) throw new Error('No image data in OpenAI response');
-
-      console.log('OpenAI image generated successfully (fallback)');
-      return res.json({ imageData: b64, provider: 'openai', success: true, fellBackFrom: geminiKey ? 'gemini' : undefined });
-    } catch (openaiError: any) {
-      console.error('OpenAI image gen also failed:', String(openaiError?.message || openaiError).slice(0, 300));
-      return res.status(500).json({
-        error: 'Both Gemini and OpenAI image generation failed',
-        geminiError: geminiError ? String(geminiError?.message || geminiError).slice(0, 300) : undefined,
-        openaiError: String(openaiError?.message || openaiError).slice(0, 300),
-      });
-    }
+  try {
+    const data = await tryModel('gemini-2.5-flash-image', 'Gemini 2.5 Flash Image');
+    console.log('Gemini 2.5 Flash Image generated successfully (fallback)');
+    return res.json({ imageData: data, provider: 'gemini-2.5-flash', success: true, fellBackFrom: 'gemini-3-pro' });
+  } catch (err: any) {
+    console.error('Both Gemini models failed.');
+    return res.status(500).json({
+      error: 'Image generation failed — both Gemini models exhausted.',
+      gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
+      gemini25FlashError: String(err?.message || err).slice(0, 300),
+      hint: 'Check Gemini API billing at https://console.cloud.google.com/billing for the project tied to your API key.',
+    });
   }
-
-  // Only Gemini configured + Gemini failed: surface the original error.
-  return res.status(500).json({
-    error: 'Image generation failed',
-    details: String(geminiError?.message || geminiError).slice(0, 500),
-  });
 });
 
 
