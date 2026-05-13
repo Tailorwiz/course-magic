@@ -159,7 +159,7 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
         let audioBuffer: AudioBuffer;
 
         // Handle audio: URL, data URL, or raw base64
-        if (lesson.audioData.startsWith('/media/') || lesson.audioData.startsWith('/objects/') || lesson.audioData.startsWith('http') || lesson.audioData.startsWith('blob:')) {
+        if (lesson.audioData.startsWith('/media/') || lesson.audioData.startsWith('/objects/') || lesson.audioData.startsWith('/api/') || lesson.audioData.startsWith('http') || lesson.audioData.startsWith('blob:')) {
             const response = await fetch(lesson.audioData);
             const arrayBuffer = await response.arrayBuffer();
             audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
@@ -198,46 +198,46 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
         const images: { img: HTMLImageElement, start: number, end: number, scriptText?: string }[] = [];
         const visuals = lesson.visuals || [];
         const audioDuration = audioBuffer.duration;
-        
+
         // Check if timing values are valid (not all zeros)
         const hasValidTiming = visuals.some(v => v.startTime > 0 || v.endTime > 0);
-        
+
         // Count visuals with images for even distribution
         const visualsWithImages = visuals.filter(v => v.imageData);
         const timePerImage = audioDuration / Math.max(1, visualsWithImages.length);
-        let imageIndex = 0;
-        
-        for (let i=0; i < visuals.length; i++) {
-            const v = visuals[i];
-            if (v.imageData) {
-                const img = new Image();
-                img.crossOrigin = 'anonymous';
-                await new Promise<void>((resolve, reject) => {
-                    img.onload = () => resolve();
-                    img.onerror = () => reject(new Error('Image failed to load'));
-                    // Handle URL, data URL, or raw base64
-                    if (v.imageData.startsWith('/media/') || v.imageData.startsWith('/objects/') || v.imageData.startsWith('http') || v.imageData.startsWith('data:')) {
-                        img.src = v.imageData;
-                    } else {
-                        img.src = `data:image/png;base64,${v.imageData}`;
-                    }
-                });
-                
-                // Use stored timing if valid, otherwise calculate even distribution
+
+        // P2.1: parallelize image preload (was sequential — N visuals × ~200ms = freeze).
+        const loadOne = (v: VisualAsset): Promise<HTMLImageElement> => new Promise((resolve, reject) => {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Image failed to load'));
+            if (
+                v.imageData.startsWith('/media/') || v.imageData.startsWith('/objects/') ||
+                v.imageData.startsWith('/api/') || v.imageData.startsWith('http') ||
+                v.imageData.startsWith('data:')
+            ) {
+                img.src = v.imageData;
+            } else {
+                img.src = `data:image/png;base64,${v.imageData}`;
+            }
+        });
+
+        const loaded = await Promise.all(
+            visuals.filter(v => v.imageData).map(async (v, idx) => {
+                const img = await loadOne(v);
                 let start: number, end: number;
                 if (hasValidTiming && (v.startTime > 0 || v.endTime > 0)) {
                     start = v.startTime;
                     end = v.endTime;
                 } else {
-                    // Evenly distribute images across audio duration
-                    start = imageIndex * timePerImage;
-                    end = (imageIndex + 1) * timePerImage;
+                    start = idx * timePerImage;
+                    end = (idx + 1) * timePerImage;
                 }
-                
-                images.push({ img, start, end, scriptText: v.scriptText });
-                imageIndex++;
-            }
-        }
+                return { img, start, end, scriptText: v.scriptText };
+            })
+        );
+        images.push(...loaded);
         
         console.log('Video render timing:', { audioDuration, imageCount: images.length, hasValidTiming, timePerImage });
         console.log('Image timings:', images.map((img, i) => ({ i, start: img.start.toFixed(2), end: img.end.toFixed(2) })));
@@ -269,8 +269,10 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
         // Canvas stays at standard 1080 height
         canvas.width = videoWidth; 
         canvas.height = videoHeight;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error("No Canvas Context");
+        // P2.1: Defer getContext until we know whether we'll use the worker. Once a
+        // canvas has any rendering context, transferControlToOffscreen() throws.
+        // We'll create ctx later only on the main-thread fallback path.
+        let ctx: CanvasRenderingContext2D | null = null;
         
         console.log('Caption settings:', { captionStyle, captionPosition, captionSize, captionMode, showCaptions, barHeight, barY, videoOffsetY, videoContentHeight, effectivePosition });
         console.log('SUBTITLE BAR DEBUG: Canvas dimensions =', canvas.width, 'x', canvas.height, '| Bar enabled:', captionMode === 'Subtitle Bar', '| showCaptions:', showCaptions);
@@ -563,6 +565,9 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
             }
         }
         
+        // P2.1: capture stream BEFORE transferControlToOffscreen — once transferred, we
+        // can't get a context (or capture) on the main thread, but the stream we already
+        // have keeps receiving frames the worker draws.
         const canvasStream = canvas.captureStream(30);
         const combinedStream = new MediaStream([
             ...canvasStream.getVideoTracks(),
@@ -575,13 +580,97 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
 
         const chunks: Blob[] = [];
         recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-        
+
+        // P2.1: Try to use a Web Worker + OffscreenCanvas so the 30fps draw loop runs
+        // off the main thread. Fall back to in-thread requestAnimationFrame if the
+        // browser doesn't support it.
+        const supportsWorker =
+            typeof Worker !== 'undefined' &&
+            typeof OffscreenCanvas !== 'undefined' &&
+            typeof (canvas as any).transferControlToOffscreen === 'function' &&
+            typeof createImageBitmap === 'function' &&
+            // captions render path is main-thread-only — only use worker when captions disabled
+            !showCaptions;
+
+        let renderWorker: Worker | null = null;
+        let offscreen: OffscreenCanvas | null = null;
+        let bitmaps: ImageBitmap[] = [];
+        if (supportsWorker) {
+            try {
+                // Order matters: transfer FIRST (must happen before any getContext()),
+                // THEN load bitmaps (createImageBitmap is async and doesn't touch canvas).
+                offscreen = (canvas as any).transferControlToOffscreen();
+                bitmaps = await Promise.all(images.map(s => createImageBitmap(s.img)));
+                // @ts-ignore — Vite transforms ?worker to a Worker constructor
+                const WorkerCtor = (await import('./workers/render-worker?worker')).default;
+                renderWorker = new WorkerCtor();
+                console.log('[render] using OffscreenCanvas worker');
+            } catch (e) {
+                console.warn('[render] OffscreenCanvas worker setup failed, falling back to main thread:', e);
+                renderWorker = null;
+                offscreen = null;
+            }
+        }
+
+        // Main-thread fallback needs a 2D context. Only call getContext if worker isn't being used.
+        if (!renderWorker) {
+            ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error("No Canvas Context");
+        }
+
         return new Promise<Blob>((resolve, reject) => {
             recorder.onstop = () => {
                 const blob = new Blob(chunks, { type: 'video/webm' });
                 audioContext.close();
+                if (renderWorker) renderWorker.terminate();
+                bitmaps.forEach(b => { try { b.close(); } catch {} });
                 resolve(blob);
             };
+
+            // P2.1 worker path needs the worker to draw frame 0 BEFORE the recorder
+            // starts capturing — otherwise MediaRecorder produces an empty webm.
+            if (renderWorker && offscreen) {
+                let firstFrameDrawn = false;
+                renderWorker.onmessage = (ev: MessageEvent) => {
+                    const data = ev.data;
+                    if (data.type === 'first-frame-drawn') {
+                        firstFrameDrawn = true;
+                        recorder.start();
+                        source.start(0);
+                        if (musicSource) musicSource.start(0);
+                        return;
+                    }
+                    if (data.type === 'progress' && onProgress) onProgress(data.pct);
+                    if (data.type === 'done' || data.type === 'cancelled') {
+                        if (firstFrameDrawn) {
+                            try { recorder.stop(); } catch {}
+                            try { source.stop(); } catch {}
+                            if (musicSource) try { musicSource.stop(); } catch {}
+                        } else {
+                            // Worker finished before drawing — shouldn't happen, but guard.
+                            audioContext.close();
+                            if (renderWorker) renderWorker.terminate();
+                            resolve(new Blob(chunks, { type: 'video/webm' }));
+                        }
+                    }
+                    if (data.type === 'error') {
+                        console.error('[render-worker] error:', data.error);
+                    }
+                };
+                renderWorker.postMessage(
+                    {
+                        type: 'start',
+                        canvas: offscreen,
+                        scenes: images.map((s, i) => ({ bitmap: bitmaps[i], start: s.start, end: s.end })),
+                        durationSec: audioBuffer.duration,
+                        videoWidth,
+                        videoHeight,
+                        fps: 30,
+                    },
+                    [offscreen as any, ...bitmaps as any[]]
+                );
+                return;
+            }
 
             recorder.start();
             source.start(0);
@@ -616,6 +705,9 @@ export const renderVideoFromLesson = async (lesson: Lesson, onProgress?: (progre
             
             const startTime = audioContext.currentTime;
             const duration = audioBuffer.duration;
+
+            // (Worker fast path is dispatched above before recorder.start();
+            // the in-thread fallback continues below.)
 
             const drawFrame = () => {
                 const now = audioContext.currentTime - startTime;

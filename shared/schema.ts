@@ -58,9 +58,12 @@ export const lessonAudio = pgTable("lesson_audio", {
   id: uuid("id").defaultRandom().primaryKey(),
   courseId: uuid("course_id").notNull(),
   lessonId: varchar("lesson_id", { length: 255 }).notNull(),
-  audioData: text("audio_data").notNull(), // base64 audio data
+  audioData: text("audio_data").notNull(), // base64 audio data (legacy; will be empty after Storage migration)
   mimeType: varchar("mime_type", { length: 100 }).default("audio/mpeg"),
   wordTimestamps: jsonb("word_timestamps").$type<Array<{word: string, start: number, end: number}>>(),
+  // P1.1: When migrated to Supabase Storage, the bucket path lives here. Server endpoints
+  // 302-redirect to the public URL so <audio src=/api/...> still works without code changes.
+  bucketPath: text("bucket_path"),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
@@ -71,9 +74,25 @@ export const lessonImages = pgTable("lesson_images", {
   courseId: uuid("course_id").notNull(),
   lessonId: varchar("lesson_id", { length: 255 }).notNull(),
   visualIndex: varchar("visual_index", { length: 50 }).notNull(), // e.g., "0", "1", "2"
-  imageData: text("image_data").notNull(), // base64 image data
+  imageData: text("image_data").notNull(), // base64 (legacy; empty after Storage migration)
   prompt: text("prompt"), // original prompt for regeneration
+  // P1.1: Storage bucket path when migrated.
+  bucketPath: text("bucket_path"),
   createdAt: timestamp("created_at").defaultNow(),
+});
+
+// P0.4: Separate table for rendered MP4/WebM videos. Avoids 69MB+ base64 strings
+// sitting inside course JSONB.
+export const lessonVideos = pgTable("lesson_videos", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  courseId: uuid("course_id").notNull(),
+  lessonId: varchar("lesson_id", { length: 255 }).notNull(),
+  videoData: text("video_data").notNull(), // base64 (legacy; empty after Storage migration)
+  mimeType: varchar("mime_type", { length: 100 }).default("video/webm"),
+  // P1.1: Storage bucket path when migrated.
+  bucketPath: text("bucket_path"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const usersRelations = relations(users, ({ many }) => ({
@@ -108,3 +127,5 @@ export type LessonAudio = typeof lessonAudio.$inferSelect;
 export type InsertLessonAudio = typeof lessonAudio.$inferInsert;
 export type LessonImage = typeof lessonImages.$inferSelect;
 export type InsertLessonImage = typeof lessonImages.$inferInsert;
+export type LessonVideo = typeof lessonVideos.$inferSelect;
+export type InsertLessonVideo = typeof lessonVideos.$inferInsert;

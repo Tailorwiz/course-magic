@@ -6,7 +6,7 @@ import { Button } from '../components/Button';
 import { safeExportCourse, exportCourseAsZip, getCourseFromDB } from '../utils';
 import { CourseDetailsModal } from '../components/CourseDetailsModal';
 import { CertificateTemplate } from '../components/CertificateTemplate';
-import { api } from '../api';
+import { api, apiFetch } from '../api';
 
 const formatDuration = (totalSeconds: number): string => {
   if (!totalSeconds || totalSeconds <= 0) return '';
@@ -242,7 +242,7 @@ export const CreatorDashboard: React.FC<CreatorDashboardProps> = ({ courses, cur
         className="hidden"
       />
       
-      {detailsCourse && <CourseDetailsModal course={detailsCourse} onClose={() => setDetailsCourse(null)} />}
+      {detailsCourse && <CourseDetailsModal course={detailsCourse} onClose={() => setDetailsCourse(null)} isCreatorView={true} />}
 
       {/* Loading Modal for Certificate */}
       {isLoadingCertCourse && (
@@ -333,7 +333,7 @@ export const CreatorDashboard: React.FC<CreatorDashboardProps> = ({ courses, cur
                variant="outline" 
                onClick={async () => {
                  try {
-                   const response = await fetch('/api/courses/export-all');
+                   const response = await apiFetch('/api/courses/export-all');
                    if (!response.ok) throw new Error('Export failed');
                    const blob = await response.blob();
                    const url = URL.createObjectURL(blob);

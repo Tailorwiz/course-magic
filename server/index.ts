@@ -1,3 +1,6 @@
+// Load .env BEFORE any other imports so DB and AI clients see the values
+import "dotenv/config";
+
 // Force GEMINI_API_KEY: Always delete GOOGLE_API_KEY to avoid SDK confusion
 // The SDK prints "Both GOOGLE_API_KEY and GEMINI_API_KEY are set" and uses the wrong one
 if (process.env.GOOGLE_API_KEY) {
@@ -12,11 +15,31 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import JSZip from "jszip";
-import { db } from "./db";
-import { users, courses, progress, tickets, certificates, lessonAudio, lessonImages } from "../shared/schema";
-import { eq, and } from "drizzle-orm";
+import { db, getRawSql } from "./db";
+import { users, courses, progress, tickets, certificates, lessonAudio, lessonImages, lessonVideos } from "../shared/schema";
+import { eq, and, sql } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
+import { signToken, requireAuth, requireAuthMedia, requireRole, requireSelfOrRole } from "./auth";
+import archiver from "archiver";
+import os from "os";
+import { spawn } from "child_process";
+// @ts-ignore — ffmpeg-static exports the binary path string
+import ffmpegPath from "ffmpeg-static";
+import { createClient as createSupabaseClient, SupabaseClient } from "@supabase/supabase-js";
+
+// P1.1: lazy-init Supabase Storage client; only when both env vars are set.
+let _supabaseClient: SupabaseClient | null = null;
+function getSupabaseStorage(): SupabaseClient | null {
+  if (_supabaseClient) return _supabaseClient;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return null;
+  _supabaseClient = createSupabaseClient(url, key);
+  return _supabaseClient;
+}
+const STORAGE_BUCKET = "lesson-media";
+const STORAGE_FILE_LIMIT = 50 * 1024 * 1024; // free-tier per-file limit
 
 const upload = multer({ 
   storage: multer.memoryStorage(),
@@ -310,7 +333,7 @@ const GEMINI_VOICE_MAP: Record<string, string> = {
 };
 
 // Gemini TTS endpoint - proxies requests to keep API key secure
-app.post("/api/tts/gemini", async (req, res) => {
+app.post("/api/tts/gemini", requireAuth, async (req, res) => {
   try {
     const { text, voiceId } = req.body;
     
@@ -379,12 +402,17 @@ app.post("/api/tts/gemini", async (req, res) => {
 });
 
 // ElevenLabs TTS endpoint - proxies requests to keep API key secure
-app.post("/api/tts/elevenlabs", async (req, res) => {
+app.post("/api/tts/elevenlabs", requireAuth, async (req, res) => {
   try {
-    const { text, voiceId, apiKey, stability, similarityBoost, speed } = req.body;
-    
-    if (!text || !voiceId || !apiKey) {
-      return res.status(400).json({ error: "Missing text, voiceId, or apiKey" });
+    const { text, voiceId, stability, similarityBoost, speed } = req.body;
+    // Prefer server-side env key. Fall back to client-supplied key for backward compat.
+    const apiKey = process.env.ELEVENLABS_API_KEY || req.body.apiKey;
+
+    if (!text || !voiceId) {
+      return res.status(400).json({ error: "Missing text or voiceId" });
+    }
+    if (!apiKey) {
+      return res.status(500).json({ error: "ElevenLabs API key not configured on server" });
     }
     
     console.log(`ElevenLabs TTS request: voiceId=${voiceId}, text length=${text.length}`);
@@ -486,7 +514,7 @@ app.post("/api/tts/elevenlabs", async (req, res) => {
 
 // ============ STAGED MEDIA UPLOAD ROUTES ============
 
-app.post("/api/media/upload", async (req, res) => {
+app.post("/api/media/upload", requireRole("CREATOR"), async (req, res) => {
   try {
     const { type, data, filename, mimeType: clientMimeType } = req.body;
     
@@ -551,7 +579,7 @@ app.post("/api/media/upload", async (req, res) => {
   }
 });
 
-app.post("/api/media/upload-batch", async (req, res) => {
+app.post("/api/media/upload-batch", requireRole("CREATOR"), async (req, res) => {
   try {
     const { items } = req.body;
     
@@ -622,7 +650,7 @@ app.post("/api/media/upload-batch", async (req, res) => {
 // ============ LESSON TAKEAWAYS STORAGE ============
 
 // Save takeaways for a specific lesson
-app.put("/api/courses/:courseId/lessons/:lessonId/takeaways", async (req, res) => {
+app.put("/api/courses/:courseId/lessons/:lessonId/takeaways", requireRole("CREATOR"), async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     const { keyTakeaways, actionItems } = req.body;
@@ -674,7 +702,7 @@ app.put("/api/courses/:courseId/lessons/:lessonId/takeaways", async (req, res) =
 // ============ LESSON AUDIO STORAGE (Separate from course payload) ============
 
 // Save audio for a specific lesson - bypasses HTTP payload limits
-app.put("/api/courses/:courseId/lessons/:lessonId/audio", async (req, res) => {
+app.put("/api/courses/:courseId/lessons/:lessonId/audio", requireRole("CREATOR"), async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     const { audioData, mimeType, wordTimestamps } = req.body;
@@ -743,25 +771,26 @@ app.put("/api/courses/:courseId/lessons/:lessonId/audio", async (req, res) => {
   }
 });
 
-// Get audio for a specific lesson
-app.get("/api/courses/:courseId/lessons/:lessonId/audio", async (req, res) => {
+// Get audio for a specific lesson — JSON form, kept for backward compat.
+// New code should prefer /audio/stream (binary) + /audio/timestamps (small JSON).
+app.get("/api/courses/:courseId/lessons/:lessonId/audio", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
-    
+
     const [audio] = await db.select()
       .from(lessonAudio)
       .where(and(
         eq(lessonAudio.courseId, courseId),
         eq(lessonAudio.lessonId, lessonId)
       ));
-    
+
     if (!audio) {
       return res.status(404).json({ error: "Audio not found" });
     }
-    
+
     // Return as data URL
     const dataUrl = `data:${audio.mimeType || 'audio/mpeg'};base64,${audio.audioData}`;
-    
+
     res.json({
       audioData: dataUrl,
       mimeType: audio.mimeType,
@@ -773,8 +802,266 @@ app.get("/api/courses/:courseId/lessons/:lessonId/audio", async (req, res) => {
   }
 });
 
+// P1.1 (fallback): ETag conditional GET for media streams. If the client sends
+// If-None-Match matching our ETag, return 304 with no body — the browser uses its
+// cached copy. Combined with Cache-Control:max-age, this means repeat lesson
+// visits skip the download entirely.
+function makeETag(parts: Array<string | number | Date | null | undefined>): string {
+  const s = parts.map(p => {
+    if (p === null || p === undefined) return '';
+    if (p instanceof Date) return String(p.getTime());
+    return String(p);
+  }).join('|');
+  // Quick non-cryptographic 32-bit hash → hex
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return `W/"${(h >>> 0).toString(16)}-${s.length}"`;
+}
+function maybeNotModified(req: import('express').Request, res: import('express').Response, etag: string): boolean {
+  res.setHeader('ETag', etag);
+  const inm = req.headers['if-none-match'];
+  if (typeof inm === 'string' && inm === etag) {
+    res.status(304).end();
+    return true;
+  }
+  return false;
+}
+
+// P1.1: Public Supabase Storage URL builder. We don't 100% redirect — for migrated
+// rows we send a 302 to the bucket URL so existing <audio src=/api/...> bindings
+// keep working without code changes.
+const SUPABASE_PUBLIC_BASE = process.env.SUPABASE_URL
+  ? `${process.env.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/public/lesson-media`
+  : null;
+function bucketPublicUrl(path: string): string | null {
+  if (!SUPABASE_PUBLIC_BASE || !path) return null;
+  return `${SUPABASE_PUBLIC_BASE}/${path}`;
+}
+
+// Wrap raw PCM audio in a WAV container so browsers can play it directly.
+// Mirrors pcmToWav() in utils.ts for the server side.
+function pcmToWavBuffer(pcm: Buffer, sampleRate = 24000, numChannels = 1): Buffer {
+  const headerLength = 44;
+  const out = Buffer.alloc(headerLength + pcm.length);
+  out.write('RIFF', 0, 'ascii');
+  out.writeUInt32LE(36 + pcm.length, 4);
+  out.write('WAVE', 8, 'ascii');
+  out.write('fmt ', 12, 'ascii');
+  out.writeUInt32LE(16, 16);             // PCM chunk size
+  out.writeUInt16LE(1, 20);              // PCM format
+  out.writeUInt16LE(numChannels, 22);
+  out.writeUInt32LE(sampleRate, 24);
+  out.writeUInt32LE(sampleRate * numChannels * 2, 28); // byte rate
+  out.writeUInt16LE(numChannels * 2, 32); // block align
+  out.writeUInt16LE(16, 34);             // bits per sample
+  out.write('data', 36, 'ascii');
+  out.writeUInt32LE(pcm.length, 40);
+  pcm.copy(out, headerLength);
+  return out;
+}
+
+// P0.1: Stream audio as raw binary so the browser can decode it off-thread.
+// The <audio> element points its src at this URL with ?token=... for auth.
+app.get("/api/courses/:courseId/lessons/:lessonId/audio/stream", requireAuthMedia, async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+
+    const [audio] = await db.select()
+      .from(lessonAudio)
+      .where(and(
+        eq(lessonAudio.courseId, courseId),
+        eq(lessonAudio.lessonId, lessonId)
+      ));
+
+    if (!audio) {
+      return res.status(404).send("Audio not found");
+    }
+
+    // P1.1: If migrated to Storage, 302 to the public bucket URL.
+    if ((audio as any).bucketPath) {
+      const url = bucketPublicUrl((audio as any).bucketPath);
+      if (url) {
+        res.setHeader('Cache-Control', 'private, max-age=86400');
+        return res.redirect(302, url);
+      }
+    }
+
+    // P1.1: ETag short-circuit (legacy DB-stored data path).
+    const etag = makeETag(['audio', courseId, lessonId, audio.mimeType, audio.audioData.length, audio.updatedAt]);
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    if (maybeNotModified(req, res, etag)) return;
+
+    // Decode base64 -> Buffer once on the server. The browser handles the binary
+    // natively from here on (no main-thread atob).
+    let buffer = Buffer.from(audio.audioData, 'base64');
+    let outMime = audio.mimeType || 'audio/mpeg';
+
+    // Raw PCM isn't playable in <audio>. Wrap it in a WAV container.
+    if (outMime === 'audio/pcm') {
+      buffer = pcmToWavBuffer(buffer, 24000, 1);
+      outMime = 'audio/wav';
+    }
+
+    res.setHeader('Content-Type', outMime);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    // Honor Range requests for seeking
+    const range = req.headers.range;
+    if (range) {
+      const match = /bytes=(\d+)-(\d*)/.exec(range);
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const end = match[2] ? parseInt(match[2], 10) : buffer.length - 1;
+        if (start < buffer.length && end >= start && end < buffer.length) {
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${buffer.length}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          return res.end(buffer.subarray(start, end + 1));
+        }
+      }
+    }
+
+    res.end(buffer);
+  } catch (error: any) {
+    console.error("Stream lesson audio error:", error.message || error);
+    res.status(500).send("Failed to stream audio");
+  }
+});
+
+// P2.3: Force-align an existing lesson's audio against OpenAI Whisper to backfill
+// word-level timestamps. Used for lessons created with Gemini TTS (no native timestamps)
+// or any lesson where wordTimestamps is empty.
+app.post("/api/courses/:courseId/lessons/:lessonId/audio/align", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const apiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "OpenAI API key not configured" });
+    }
+
+    const [audio] = await db.select()
+      .from(lessonAudio)
+      .where(and(
+        eq(lessonAudio.courseId, courseId),
+        eq(lessonAudio.lessonId, lessonId)
+      ));
+
+    if (!audio) {
+      return res.status(404).json({ error: "Audio not found" });
+    }
+
+    const t0 = Date.now();
+    let buffer: Buffer;
+    let outMime = audio.mimeType || 'audio/mpeg';
+    // P1.1: pull from bucket if migrated, else from inline base64.
+    if ((audio as any).bucketPath) {
+      const url = bucketPublicUrl((audio as any).bucketPath);
+      if (!url) return res.status(500).json({ error: "Cannot resolve bucket URL" });
+      const resp = await fetch(url);
+      if (!resp.ok) return res.status(502).json({ error: `Bucket fetch ${resp.status}` });
+      buffer = Buffer.from(await resp.arrayBuffer());
+    } else {
+      buffer = Buffer.from(audio.audioData, 'base64');
+    }
+    let extension = outMime === 'audio/mpeg' ? 'mp3' : outMime === 'audio/wav' ? 'wav' : 'audio';
+
+    // Whisper handles PCM only via WAV wrapper.
+    if (outMime === 'audio/pcm') {
+      buffer = pcmToWavBuffer(buffer, 24000, 1);
+      outMime = 'audio/wav';
+      extension = 'wav';
+    }
+
+    // OpenAI Whisper limit: 25MB. Bail clearly if oversized.
+    if (buffer.length > 25 * 1024 * 1024) {
+      return res.status(413).json({
+        error: `Audio is ${(buffer.length / 1024 / 1024).toFixed(1)}MB; OpenAI Whisper max is 25MB. Split or downsample first.`,
+      });
+    }
+
+    console.log(`[Align] Sending ${(buffer.length / 1024 / 1024).toFixed(2)}MB ${outMime} to Whisper for ${lessonId}`);
+
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: outMime }), `lesson.${extension}`);
+    form.append('model', 'whisper-1');
+    form.append('response_format', 'verbose_json');
+    form.append('timestamp_granularities[]', 'word');
+
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: form,
+    });
+
+    if (!whisperRes.ok) {
+      const errBody = await whisperRes.text().catch(() => '');
+      console.error(`[Align] Whisper ${whisperRes.status}: ${errBody.substring(0, 300)}`);
+      return res.status(502).json({ error: `Whisper API ${whisperRes.status}`, details: errBody.substring(0, 500) });
+    }
+
+    const transcription = await whisperRes.json() as any;
+    const words: Array<{ word: string; start: number; end: number }> =
+      Array.isArray(transcription.words)
+        ? transcription.words.map((w: any) => ({ word: w.word, start: w.start, end: w.end }))
+        : [];
+
+    const elapsed = Date.now() - t0;
+    console.log(`[Align] ${words.length} words from Whisper in ${elapsed}ms`);
+
+    // Persist
+    await db.update(lessonAudio)
+      .set({ wordTimestamps: words, updatedAt: new Date() })
+      .where(and(
+        eq(lessonAudio.courseId, courseId),
+        eq(lessonAudio.lessonId, lessonId)
+      ));
+
+    res.json({
+      success: true,
+      wordCount: words.length,
+      elapsedMs: elapsed,
+      audioMB: +(buffer.length / 1024 / 1024).toFixed(2),
+      transcriptPreview: typeof transcription.text === 'string'
+        ? transcription.text.slice(0, 200)
+        : null,
+    });
+  } catch (error: any) {
+    console.error("[Align] Error:", error?.message || error);
+    res.status(500).json({ error: error?.message || "Failed to align audio" });
+  }
+});
+
+// P0.1: Lightweight metadata + word timestamps for captions, without the audio bytes.
+app.get("/api/courses/:courseId/lessons/:lessonId/audio/timestamps", requireAuth, async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+
+    const [audio] = await db.select({
+      mimeType: lessonAudio.mimeType,
+      wordTimestamps: lessonAudio.wordTimestamps,
+    })
+      .from(lessonAudio)
+      .where(and(
+        eq(lessonAudio.courseId, courseId),
+        eq(lessonAudio.lessonId, lessonId)
+      ));
+
+    if (!audio) {
+      return res.status(404).json({ error: "Audio not found" });
+    }
+
+    res.json({
+      mimeType: audio.mimeType || 'audio/mpeg',
+      wordTimestamps: audio.wordTimestamps || []
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || "Failed to get timestamps" });
+  }
+});
+
 // Check if lesson has audio stored (for UI indicators)
-app.get("/api/courses/:courseId/lessons/:lessonId/audio/exists", async (req, res) => {
+app.get("/api/courses/:courseId/lessons/:lessonId/audio/exists", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     
@@ -794,7 +1081,7 @@ app.get("/api/courses/:courseId/lessons/:lessonId/audio/exists", async (req, res
 // ============ LESSON IMAGES ROUTES ============
 
 // Save images for a lesson (multiple visuals)
-app.post("/api/courses/:courseId/lessons/:lessonId/images", async (req, res) => {
+app.post("/api/courses/:courseId/lessons/:lessonId/images", requireRole("CREATOR"), async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     const { images } = req.body; // Array of { visualIndex, imageData, prompt }
@@ -852,7 +1139,7 @@ app.post("/api/courses/:courseId/lessons/:lessonId/images", async (req, res) => 
 });
 
 // Get all images for a lesson
-app.get("/api/courses/:courseId/lessons/:lessonId/images", async (req, res) => {
+app.get("/api/courses/:courseId/lessons/:lessonId/images", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     
@@ -894,7 +1181,7 @@ app.get("/api/courses/:courseId/lessons/:lessonId/images", async (req, res) => {
 });
 
 // Get image metadata (indices only, no data) for lazy loading - MUST be before /:visualIndex
-app.get("/api/courses/:courseId/lessons/:lessonId/images/metadata", async (req, res) => {
+app.get("/api/courses/:courseId/lessons/:lessonId/images/metadata", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     console.log(`[Get Metadata] Fetching for course=${courseId}, lesson=${lessonId}`);
@@ -923,7 +1210,7 @@ app.get("/api/courses/:courseId/lessons/:lessonId/images/metadata", async (req, 
 });
 
 // Check if lesson has images stored - MUST be before /:visualIndex
-app.get("/api/courses/:courseId/lessons/:lessonId/images/exists", async (req, res) => {
+app.get("/api/courses/:courseId/lessons/:lessonId/images/exists", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId } = req.params;
     
@@ -941,11 +1228,11 @@ app.get("/api/courses/:courseId/lessons/:lessonId/images/exists", async (req, re
 });
 
 // Get a single image by visualIndex (for lazy loading) - MUST be after /metadata and /exists
-app.get("/api/courses/:courseId/lessons/:lessonId/images/:visualIndex", async (req, res) => {
+app.get("/api/courses/:courseId/lessons/:lessonId/images/:visualIndex", requireAuth, async (req, res) => {
   try {
     const { courseId, lessonId, visualIndex } = req.params;
     console.log(`[Get Single Image] Fetching index ${visualIndex} for lesson ${lessonId}`);
-    
+
     const images = await db.select()
       .from(lessonImages)
       .where(and(
@@ -954,16 +1241,16 @@ app.get("/api/courses/:courseId/lessons/:lessonId/images/:visualIndex", async (r
         eq(lessonImages.visualIndex, visualIndex)
       ))
       .limit(1);
-    
+
     if (images.length === 0) {
       return res.status(404).json({ error: "Image not found" });
     }
-    
+
     let imageData = images[0].imageData;
     if (!imageData.startsWith('data:')) {
       imageData = `data:image/png;base64,${imageData}`;
     }
-    
+
     console.log(`[Get Single Image] Found image, size: ${(imageData.length/1024).toFixed(0)}KB`);
     res.json({
       visualIndex: parseInt(images[0].visualIndex),
@@ -976,10 +1263,482 @@ app.get("/api/courses/:courseId/lessons/:lessonId/images/:visualIndex", async (r
   }
 });
 
+// P2.2: Render a lesson's audio+image timeline into a single MP4 server-side using
+// the bundled ffmpeg binary. Output goes straight into the lesson_videos table so
+// students can stream a real <video> instead of running the live audio+image sync.
+async function renderLessonToMp4(
+  courseId: string,
+  lessonId: string,
+  opts: {
+    sourceAudioCourseId?: string;
+    sourceAudioLessonId?: string;
+    sourceImagesCourseId?: string;
+    sourceImagesLessonId?: string;
+    visuals?: Array<{ visualIndex: number | string; startTime?: number; endTime?: number }>;
+    durationSec?: number;
+    width?: number;
+    height?: number;
+  } = {}
+): Promise<{ mp4Buffer: Buffer; durationSec: number; imageCount: number }> {
+  const audioCourse = opts.sourceAudioCourseId || courseId;
+  const audioLesson = opts.sourceAudioLessonId || lessonId;
+  const imagesCourse = opts.sourceImagesCourseId || courseId;
+  const imagesLesson = opts.sourceImagesLessonId || lessonId;
+  const width = opts.width || 1280;
+  const height = opts.height || 720;
+
+  const [audio] = await db.select()
+    .from(lessonAudio)
+    .where(and(eq(lessonAudio.courseId, audioCourse), eq(lessonAudio.lessonId, audioLesson)));
+  if (!audio) throw new Error(`No audio for ${audioCourse}/${audioLesson}`);
+
+  // P1.1: fetch from bucket if migrated, else decode inline base64.
+  let audioBuf: Buffer;
+  if ((audio as any).bucketPath) {
+    const url = bucketPublicUrl((audio as any).bucketPath);
+    if (!url) throw new Error('Cannot resolve audio bucket URL');
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Bucket fetch ${resp.status}`);
+    audioBuf = Buffer.from(await resp.arrayBuffer());
+  } else {
+    audioBuf = Buffer.from(audio.audioData, 'base64');
+  }
+  let audioExt = audio.mimeType === 'audio/mpeg' ? 'mp3' : 'wav';
+  if (audio.mimeType === 'audio/pcm') {
+    audioBuf = pcmToWavBuffer(audioBuf, 24000, 1);
+    audioExt = 'wav';
+  }
+
+  const imageRows = await db.select()
+    .from(lessonImages)
+    .where(and(eq(lessonImages.courseId, imagesCourse), eq(lessonImages.lessonId, imagesLesson)));
+  if (imageRows.length === 0) throw new Error(`No images for ${imagesCourse}/${imagesLesson}`);
+
+  imageRows.sort((a, b) => parseInt(a.visualIndex) - parseInt(b.visualIndex));
+
+  const work = path.join(os.tmpdir(), `cm-render-${courseId.slice(0, 8)}-${Date.now()}`);
+  fs.mkdirSync(work, { recursive: true });
+
+  try {
+    const audioPath = path.join(work, `audio.${audioExt}`);
+    fs.writeFileSync(audioPath, audioBuf);
+
+    const imageFiles: { path: string }[] = [];
+    for (let i = 0; i < imageRows.length; i++) {
+      const img = imageRows[i];
+      let buf: Buffer;
+      if ((img as any).bucketPath) {
+        const url = bucketPublicUrl((img as any).bucketPath);
+        if (!url) throw new Error('Cannot resolve image bucket URL');
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Bucket image fetch ${resp.status} for ${(img as any).bucketPath}`);
+        buf = Buffer.from(await resp.arrayBuffer());
+      } else {
+        let raw = img.imageData;
+        if (raw.startsWith('data:')) {
+          const m = /^data:([^;]+);base64,(.+)$/.exec(raw);
+          if (m) raw = m[2];
+        }
+        buf = Buffer.from(raw, 'base64');
+      }
+      let ext = 'png';
+      if (buf.length >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) ext = 'jpg';
+      const p = path.join(work, `img-${String(i).padStart(4, '0')}.${ext}`);
+      fs.writeFileSync(p, buf);
+      imageFiles.push({ path: p });
+    }
+
+    const visualTimings: Array<{ start: number; end: number }> = [];
+    if (opts.visuals && opts.visuals.length > 0) {
+      const sorted = [...opts.visuals].sort((a, b) =>
+        parseInt(String(a.visualIndex)) - parseInt(String(b.visualIndex))
+      );
+      for (let i = 0; i < imageRows.length; i++) {
+        const t = sorted[i] || sorted[sorted.length - 1];
+        const start = typeof t.startTime === 'number' ? t.startTime : i * (opts.durationSec || 60) / imageRows.length;
+        const end = typeof t.endTime === 'number' ? t.endTime : start + 5;
+        visualTimings.push({ start, end });
+      }
+    } else {
+      const total = opts.durationSec || imageRows.length * 5;
+      const per = total / imageRows.length;
+      for (let i = 0; i < imageRows.length; i++) {
+        visualTimings.push({ start: i * per, end: (i + 1) * per });
+      }
+    }
+
+    const concatLines: string[] = [];
+    for (let i = 0; i < imageFiles.length; i++) {
+      const t = visualTimings[i];
+      const dur = Math.max(0.1, t.end - t.start);
+      const escaped = imageFiles[i].path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      concatLines.push(`file '${escaped}'`);
+      concatLines.push(`duration ${dur.toFixed(3)}`);
+    }
+    {
+      const escaped = imageFiles[imageFiles.length - 1].path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      concatLines.push(`file '${escaped}'`);
+    }
+    const concatPath = path.join(work, 'concat.txt');
+    fs.writeFileSync(concatPath, concatLines.join('\n'));
+
+    const outPath = path.join(work, 'output.mp4');
+    const ffmpegBin = (ffmpegPath as unknown as string) || 'ffmpeg';
+    // P2.2 v2 — ultrafast preset + slightly higher CRF makes encoding ~3-5× faster
+    // at the cost of ~30% larger files. Source images are static between transitions
+    // so the encoder has very little real motion to compress; ultrafast still produces
+    // an excellent visual result. r=15 caps frame rate (slideshows don't need 30fps).
+    const args = [
+      '-y',
+      '-f', 'concat', '-safe', '0', '-i', concatPath,
+      '-i', audioPath,
+      '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p`,
+      '-r', '15',                    // 15 fps is plenty for a slideshow with held frames
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',        // was 'fast' — 3-5× faster encode
+      '-tune', 'stillimage',         // optimize for static frames between transitions
+      '-crf', '26',                  // was 23; 26 still looks great for slideshows
+      '-c:a', 'aac',
+      '-b:a', '96k',                 // was 128k; voice content fine at 96k
+      '-shortest',
+      '-movflags', '+faststart',     // critical: header at front so playback starts before download done
+      outPath,
+    ];
+
+    console.log(`[Render MP4] Spawning ffmpeg for ${courseId}/${lessonId}: ${imageRows.length} images, ${(audioBuf.length / 1024 / 1024).toFixed(2)}MB audio`);
+    const t0 = Date.now();
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(ffmpegBin, args, { windowsHide: true });
+      let stderr = '';
+      child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-1500)}`));
+      });
+    });
+
+    const elapsed = Date.now() - t0;
+    const mp4Buffer = fs.readFileSync(outPath);
+    console.log(`[Render MP4] Done in ${elapsed}ms; ${(mp4Buffer.length / 1024 / 1024).toFixed(2)}MB`);
+
+    const finalDur = visualTimings[visualTimings.length - 1]?.end || 0;
+    return { mp4Buffer, durationSec: finalDur, imageCount: imageRows.length };
+  } finally {
+    try {
+      const files = fs.readdirSync(work);
+      for (const f of files) fs.unlinkSync(path.join(work, f));
+      fs.rmdirSync(work);
+    } catch (e) { console.warn('cleanup failed:', e); }
+  }
+}
+
+app.post("/api/courses/:courseId/lessons/:lessonId/render-mp4", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    let {
+      visuals,
+      durationSec,
+      sourceAudioCourseId,
+      sourceAudioLessonId,
+      sourceImagesCourseId,
+      sourceImagesLessonId,
+      width,
+      height,
+    } = req.body || {};
+
+    // If the client didn't send visual timings, look them up from courses.data so the
+    // resulting MP4 honors the real audio-driven timing.
+    if (!visuals || !Array.isArray(visuals) || visuals.length === 0) {
+      const [courseRow] = await db.select().from(courses).where(eq(courses.id, courseId));
+      const data: any = courseRow?.data;
+      if (data?.modules) {
+        outer: for (const m of data.modules) {
+          for (const l of (m.lessons || [])) {
+            if (l?.id === lessonId) {
+              const arr = (l.visuals || []) as any[];
+              visuals = arr.map((v, i) => ({
+                visualIndex: i,
+                startTime: typeof v.startTime === 'number' ? v.startTime : 0,
+                endTime: typeof v.endTime === 'number' ? v.endTime : 0,
+              }));
+              if (typeof l.durationSeconds === 'number' && !durationSec) durationSec = l.durationSeconds;
+              // Source overrides for composite lessons
+              if (!sourceAudioCourseId && l.sourceVideoId) sourceAudioCourseId = l.sourceVideoId;
+              if (!sourceAudioLessonId && l.sourceLessonId) sourceAudioLessonId = l.sourceLessonId;
+              if (!sourceImagesCourseId && l.sourceVideoId) sourceImagesCourseId = l.sourceVideoId;
+              if (!sourceImagesLessonId && l.sourceLessonId) sourceImagesLessonId = l.sourceLessonId;
+              break outer;
+            }
+          }
+        }
+      }
+    }
+
+    const result = await renderLessonToMp4(courseId, lessonId, {
+      visuals, durationSec,
+      sourceAudioCourseId, sourceAudioLessonId,
+      sourceImagesCourseId, sourceImagesLessonId,
+      width, height,
+    });
+
+    // Try to upload directly to Supabase Storage. If it fits and succeeds, store
+    // bucket_path and skip the giant base64 in lesson_videos.video_data.
+    let bucketPath: string | null = null;
+    let storedAsBase64 = false;
+    const sbStorage = getSupabaseStorage();
+    if (sbStorage && result.mp4Buffer.length <= STORAGE_FILE_LIMIT) {
+      const path = `${courseId}/${lessonId}/video.mp4`;
+      const { error: uerr } = await sbStorage.storage
+        .from(STORAGE_BUCKET)
+        .upload(path, result.mp4Buffer, { contentType: 'video/mp4', upsert: true, cacheControl: '86400' });
+      if (uerr) {
+        console.warn("[Render MP4] Bucket upload failed; falling back to inline base64:", uerr.message);
+      } else {
+        bucketPath = path;
+        console.log(`[Render MP4] Uploaded to bucket: ${path}`);
+      }
+    }
+
+    const base64 = bucketPath ? '' : result.mp4Buffer.toString('base64');
+    if (!bucketPath) storedAsBase64 = true;
+
+    const existing = await db.select({ id: lessonVideos.id })
+      .from(lessonVideos)
+      .where(and(eq(lessonVideos.courseId, courseId), eq(lessonVideos.lessonId, lessonId)));
+    if (existing.length > 0) {
+      await db.update(lessonVideos)
+        .set({ videoData: base64, bucketPath, mimeType: 'video/mp4', updatedAt: new Date() })
+        .where(eq(lessonVideos.id, existing[0].id));
+    } else {
+      await db.insert(lessonVideos).values({
+        courseId, lessonId, videoData: base64, bucketPath, mimeType: 'video/mp4',
+      });
+    }
+
+    // Mark hasRenderedVideoInDb on the lesson inside courses.data so the list endpoint
+    // surfaces it and the player switches to <video src=>.
+    const [courseRow] = await db.select().from(courses).where(eq(courses.id, courseId));
+    if (courseRow?.data) {
+      const data: any = courseRow.data;
+      let touched = false;
+      for (const m of (data.modules || [])) {
+        for (const l of (m.lessons || [])) {
+          if (l?.id === lessonId) {
+            l.hasRenderedVideoInDb = true;
+            // Clear any stale inline renderedVideoUrl to avoid bloat
+            if (l.renderedVideoUrl && l.renderedVideoUrl.startsWith('data:')) l.renderedVideoUrl = '';
+            touched = true;
+          }
+        }
+      }
+      if (touched) {
+        await db.update(courses)
+          .set({ data, updatedAt: new Date() })
+          .where(eq(courses.id, courseId));
+      }
+    }
+
+    invalidateCourseListCache();
+
+    res.json({
+      success: true,
+      mp4Bytes: result.mp4Buffer.length,
+      mp4MB: +(result.mp4Buffer.length / 1024 / 1024).toFixed(2),
+      durationSec: result.durationSec,
+      imageCount: result.imageCount,
+      storedTo: bucketPath ? 'bucket' : 'database',
+      bucketPath,
+    });
+  } catch (error: any) {
+    console.error("[Render MP4] Error:", error?.message || error);
+    res.status(500).json({ error: error?.message || "Failed to render MP4" });
+  }
+});
+
+// ============ LESSON VIDEO (P0.4) ============
+
+// Save rendered video (base64) to its own table — keeps course JSON small.
+app.put("/api/courses/:courseId/lessons/:lessonId/video", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const { videoData, mimeType } = req.body;
+    if (!videoData) return res.status(400).json({ error: "videoData required" });
+
+    // If client sent a data URL, strip the prefix so we store pure base64 + mime separately
+    let cleanBase64 = videoData;
+    let detectedMime = mimeType || 'video/webm';
+    if (videoData.startsWith('data:')) {
+      const m = /^data:([^;]+);base64,(.+)$/.exec(videoData);
+      if (m) {
+        detectedMime = mimeType || m[1];
+        cleanBase64 = m[2];
+      }
+    }
+
+    const [existing] = await db.select({ id: lessonVideos.id })
+      .from(lessonVideos)
+      .where(and(eq(lessonVideos.courseId, courseId), eq(lessonVideos.lessonId, lessonId)));
+
+    if (existing) {
+      await db.update(lessonVideos)
+        .set({ videoData: cleanBase64, mimeType: detectedMime, updatedAt: new Date() })
+        .where(eq(lessonVideos.id, existing.id));
+    } else {
+      await db.insert(lessonVideos).values({
+        courseId, lessonId, videoData: cleanBase64, mimeType: detectedMime,
+      });
+    }
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Save lesson video error:", error.message || error);
+    res.status(500).json({ error: error.message || "Failed to save video" });
+  }
+});
+
+// Stream rendered video as raw bytes for <video src=...>
+app.get("/api/courses/:courseId/lessons/:lessonId/video/stream", requireAuthMedia, async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const [video] = await db.select()
+      .from(lessonVideos)
+      .where(and(eq(lessonVideos.courseId, courseId), eq(lessonVideos.lessonId, lessonId)));
+
+    if (!video) return res.status(404).send("Video not found");
+
+    // P1.1: redirect to bucket if migrated.
+    if ((video as any).bucketPath) {
+      const url = bucketPublicUrl((video as any).bucketPath);
+      if (url) {
+        res.setHeader('Cache-Control', 'private, max-age=86400');
+        return res.redirect(302, url);
+      }
+    }
+
+    // P1.1 ETag — keyed by row id + size + updatedAt.
+    const etag = makeETag(['video', video.id, video.videoData.length, video.updatedAt]);
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    if (maybeNotModified(req, res, etag)) return;
+
+    const buffer = Buffer.from(video.videoData, 'base64');
+    const mimeType = video.mimeType || 'video/webm';
+
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+
+    const range = req.headers.range;
+    if (range) {
+      const match = /bytes=(\d+)-(\d*)/.exec(range);
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const end = match[2] ? parseInt(match[2], 10) : buffer.length - 1;
+        if (start < buffer.length && end >= start && end < buffer.length) {
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${buffer.length}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          return res.end(buffer.subarray(start, end + 1));
+        }
+      }
+    }
+    res.end(buffer);
+  } catch (error: any) {
+    console.error("Stream lesson video error:", error.message || error);
+    res.status(500).send("Failed to stream video");
+  }
+});
+
+app.get("/api/courses/:courseId/lessons/:lessonId/video/exists", requireAuth, async (req, res) => {
+  try {
+    const { courseId, lessonId } = req.params;
+    const [video] = await db.select({ id: lessonVideos.id })
+      .from(lessonVideos)
+      .where(and(eq(lessonVideos.courseId, courseId), eq(lessonVideos.lessonId, lessonId)));
+    res.json({ exists: !!video });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || "Failed to check video" });
+  }
+});
+
+// P0.2: Stream a single image as raw PNG/JPG bytes so <img src=...> can load it
+// natively, off-thread, with browser-managed cache. Must be after /metadata and /exists.
+app.get("/api/courses/:courseId/lessons/:lessonId/images/:visualIndex/stream", requireAuthMedia, async (req, res) => {
+  try {
+    const { courseId, lessonId, visualIndex } = req.params;
+
+    const images = await db.select()
+      .from(lessonImages)
+      .where(and(
+        eq(lessonImages.courseId, courseId),
+        eq(lessonImages.lessonId, lessonId),
+        eq(lessonImages.visualIndex, visualIndex)
+      ))
+      .limit(1);
+
+    if (images.length === 0) {
+      return res.status(404).send("Image not found");
+    }
+
+    // P1.1: redirect to bucket if migrated.
+    if ((images[0] as any).bucketPath) {
+      const url = bucketPublicUrl((images[0] as any).bucketPath);
+      if (url) {
+        res.setHeader('Cache-Control', 'private, max-age=86400, immutable');
+        return res.redirect(302, url);
+      }
+    }
+
+    // P1.1 ETag — image content is keyed by its row id (immutable per visualIndex).
+    const etag = makeETag(['img', images[0].id, images[0].imageData.length]);
+    res.setHeader('Cache-Control', 'private, max-age=86400, immutable');
+    if (maybeNotModified(req, res, etag)) return;
+
+    let raw = images[0].imageData;
+    let mimeType: string | null = null;
+    // If stored as full data URL, peel off the prefix and remember the type.
+    if (raw.startsWith('data:')) {
+      const m = /^data:([^;]+);base64,(.+)$/.exec(raw);
+      if (m) {
+        mimeType = m[1];
+        raw = m[2];
+      } else {
+        const comma = raw.indexOf(',');
+        if (comma > 0) raw = raw.slice(comma + 1);
+      }
+    }
+
+    const buffer = Buffer.from(raw, 'base64');
+
+    // Sniff the magic bytes if we don't have an explicit mime type.
+    if (!mimeType) {
+      if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+        mimeType = 'image/png';
+      } else if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+        mimeType = 'image/jpeg';
+      } else if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
+        mimeType = 'image/webp';
+      } else if (buffer.length >= 6 && buffer.toString('ascii', 0, 6).startsWith('GIF8')) {
+        mimeType = 'image/gif';
+      } else {
+        mimeType = 'image/png'; // safe default
+      }
+    }
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', String(buffer.length));
+    // Aggressive cache — image bytes never change for a given (course, lesson, visualIndex).
+    res.setHeader('Cache-Control', 'private, max-age=86400, immutable');
+    res.end(buffer);
+  } catch (error: any) {
+    console.error("Stream single image error:", error.message || error);
+    res.status(500).send("Failed to stream image");
+  }
+});
+
 // ============ ADMIN/MAINTENANCE ROUTES ============
 
 // Recalculate visual timing from word timestamps
-app.post("/api/admin/fix-lesson-timing", async (req, res) => {
+app.post("/api/admin/fix-lesson-timing", requireRole("CREATOR"), async (req, res) => {
   try {
     const { courseId, lessonId } = req.body;
     
@@ -1148,7 +1907,7 @@ app.post("/api/admin/fix-lesson-timing", async (req, res) => {
 });
 
 // Fix lesson images - delete extras and renumber to 0-based indices
-app.post("/api/admin/fix-lesson-images", async (req, res) => {
+app.post("/api/admin/fix-lesson-images", requireRole("CREATOR"), async (req, res) => {
   try {
     const { courseId, lessonId, keepCount } = req.body;
     
@@ -1221,18 +1980,19 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     const [user] = await db.select().from(users).where(eq(users.email, email));
-    
+
     if (!user) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    
+
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
-    
+
     const { password: _, ...userWithoutPassword } = user;
-    res.json(userWithoutPassword);
+    const token = signToken({ userId: user.id, email: user.email, role: user.role });
+    res.json({ user: userWithoutPassword, token });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
@@ -1242,36 +2002,46 @@ app.post("/api/auth/login", async (req, res) => {
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, avatarUrl, phone, city, state } = req.body;
-    
+
     const existing = await db.select().from(users).where(eq(users.email, email));
     if (existing.length > 0) {
       return res.status(400).json({ error: "Email already exists" });
     }
-    
+
     const hashedPassword = await bcrypt.hash(password, 10);
     const [newUser] = await db.insert(users).values({
       name,
       email,
       password: hashedPassword,
-      role: "STUDENT",
+      role: "STUDENT", // Public registration always creates STUDENT — never trust client-supplied role
       avatarUrl: avatarUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`,
       phone,
       city,
       state,
       assignedCourseIds: [],
     }).returning();
-    
+
     const { password: _, ...userWithoutPassword } = newUser;
-    res.json(userWithoutPassword);
+    const token = signToken({ userId: newUser.id, email: newUser.email, role: newUser.role });
+    res.json({ user: userWithoutPassword, token });
   } catch (error) {
     console.error("Register error:", error);
     res.status(500).json({ error: "Registration failed" });
   }
 });
 
+// Lookup current user from token — useful for client to validate session on reload
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  const auth = (req as any).auth;
+  const [user] = await db.select().from(users).where(eq(users.id, auth.userId));
+  if (!user) return res.status(404).json({ error: "User not found" });
+  const { password: _, ...userWithoutPassword } = user;
+  res.json(userWithoutPassword);
+});
+
 // ============ USERS ROUTES ============
 
-app.get("/api/users", async (req, res) => {
+app.get("/api/users", requireRole("CREATOR"), async (req, res) => {
   try {
     const allUsers = await db.select().from(users);
     const usersWithoutPasswords = allUsers.map(({ password, ...rest }) => rest);
@@ -1282,7 +2052,7 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
-app.get("/api/users/:id", async (req, res) => {
+app.get("/api/users/:id", requireSelfOrRole("id", "CREATOR"), async (req, res) => {
   try {
     const [user] = await db.select().from(users).where(eq(users.id, req.params.id));
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -1293,20 +2063,27 @@ app.get("/api/users/:id", async (req, res) => {
   }
 });
 
-app.put("/api/users/:id", async (req, res) => {
+app.put("/api/users/:id", requireSelfOrRole("id", "CREATOR"), async (req, res) => {
   try {
+    const auth = (req as any).auth;
+    const isCreator = auth.role === "CREATOR";
     const { name, email, password, avatarUrl, phone, city, state, assignedCourseIds } = req.body;
-    const updateData: any = { name, email, avatarUrl, phone, city, state, assignedCourseIds };
-    
+
+    // Self-edits cannot change role or course assignments — only CREATORs can
+    const updateData: any = { name, email, avatarUrl, phone, city, state };
+    if (isCreator && assignedCourseIds !== undefined) {
+      updateData.assignedCourseIds = assignedCourseIds;
+    }
+
     if (password) {
       updateData.password = await bcrypt.hash(password, 10);
     }
-    
+
     const [updated] = await db.update(users)
       .set(updateData)
       .where(eq(users.id, req.params.id))
       .returning();
-    
+
     if (!updated) return res.status(404).json({ error: "User not found" });
     const { password: _, ...userWithoutPassword } = updated;
     res.json(userWithoutPassword);
@@ -1315,7 +2092,7 @@ app.put("/api/users/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/users/:id", async (req, res) => {
+app.delete("/api/users/:id", requireRole("CREATOR"), async (req, res) => {
   try {
     await db.delete(users).where(eq(users.id, req.params.id));
     res.json({ success: true });
@@ -1326,13 +2103,29 @@ app.delete("/api/users/:id", async (req, res) => {
 
 // ============ COURSES ROUTES ============
 
-app.get("/api/courses", async (req, res) => {
-  // Prevent caching - always return fresh data
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  
-  console.log("GET /api/courses - Starting request");
+// In-memory cache for the lightweight course list. Course mutations bust this on save.
+// TTL is short enough (30s) that stale data is rare; long enough to absorb dashboard refreshes.
+let courseListCache: { payload: any[]; expiresAt: number } | null = null;
+const COURSE_LIST_TTL_MS = 30_000;
+
+function invalidateCourseListCache() {
+  courseListCache = null;
+}
+
+app.get("/api/courses", requireAuth, async (req, res) => {
+  // Don't let intermediaries cache (auth-bound). The browser may use it briefly via the
+  // ETag-style flow if we add one later; for now, the server-side cache below is the win.
+  res.setHeader('Cache-Control', 'private, max-age=10');
+
+  // Server-side cache hit — short-circuit DB entirely.
+  const now = Date.now();
+  if (courseListCache && courseListCache.expiresAt > now) {
+    const ageMs = COURSE_LIST_TTL_MS - (courseListCache.expiresAt - now);
+    res.setHeader('X-Cache', `HIT age=${ageMs}ms`);
+    return res.json(courseListCache.payload);
+  }
+
+  console.log("GET /api/courses - Cache miss, querying DB...");
   
   const isConnectionError = (error: any): boolean => {
     const msg = error?.message || '';
@@ -1346,10 +2139,60 @@ app.get("/api/courses", async (req, res) => {
   
   const fetchCourses = async (attempt = 1): Promise<any[]> => {
     try {
-      console.log(`Querying courses (attempt ${attempt})...`);
-      const allCourses = await db.select().from(courses);
-      console.log("Courses query returned:", allCourses.length, "courses");
-      return allCourses;
+      const tStart = Date.now();
+      // Bypass drizzle's execute() and go straight through postgres-js — the same path
+      // benchmarked at 246ms vs ~1.7s through drizzle.execute. SQL builds the lightweight
+      // modules array server-side; we never ship inline base64 audio/image bytes.
+      const sqlClient = getRawSql();
+      const rows = await sqlClient`
+        SELECT
+          id,
+          created_at AS "createdAt",
+          updated_at AS "updatedAt",
+          data->>'id'                     AS d_id,
+          data->>'type'                   AS d_type,
+          data->>'title'                  AS d_title,
+          data->>'headline'               AS d_headline,
+          LEFT(data->>'description', 500) AS d_description,
+          data->>'ecoverUrl'              AS d_ecover_url,
+          data->>'status'                 AS d_status,
+          (data->>'totalStudents')::int   AS d_total_students,
+          (data->>'rating')::float        AS d_rating,
+          (
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'id', m->>'id',
+                'title', m->>'title',
+                'lessons', (
+                  SELECT jsonb_agg(
+                    jsonb_build_object(
+                      'id', l->>'id',
+                      'title', l->>'title',
+                      'status', l->>'status',
+                      'voice', l->>'voice',
+                      'duration', l->>'duration',
+                      'hostedVideoUrl', l->>'hostedVideoUrl',
+                      'videoUrl', l->>'videoUrl',
+                      'countsTowardCertificate', COALESCE((l->>'countsTowardCertificate')::boolean, false),
+                      'visualCount', jsonb_array_length(COALESCE(l->'visuals', '[]'::jsonb)),
+                      'hasAudio', (l->>'audioData' IS NOT NULL AND length(l->>'audioData') > 100),
+                      'hasAudioInDb', COALESCE((l->>'hasAudioInDb')::boolean, false),
+                      'hasImagesInDb', COALESCE((l->>'hasImagesInDb')::boolean, false),
+                      'hasRenderedVideo', ((l->>'renderedVideoUrl' IS NOT NULL AND length(l->>'renderedVideoUrl') > 0)
+                                          OR COALESCE((l->>'hasRenderedVideoInDb')::boolean, false)),
+                      'hasRenderedVideoInDb', COALESCE((l->>'hasRenderedVideoInDb')::boolean, false)
+                    )
+                  )
+                  FROM jsonb_array_elements(COALESCE(m->'lessons', '[]'::jsonb)) l
+                )
+              )
+            )
+            FROM jsonb_array_elements(COALESCE(data->'modules', '[]'::jsonb)) m
+          )                               AS d_modules
+        FROM courses
+      `;
+      console.log(`Courses lightweight SELECT: ${Date.now() - tStart}ms (${rows.length} rows)`);
+      return rows as any[];
     } catch (error: any) {
       console.error(`Get courses error (attempt ${attempt}):`, error?.message || error);
       if (attempt < 4 && isConnectionError(error)) {
@@ -1362,104 +2205,150 @@ app.get("/api/courses", async (req, res) => {
       throw error;
     }
   };
-  
+
   try {
-    const allCourses = await fetchCourses();
-    // Return MINIMAL summaries - courses can be 8MB+ each with embedded media
-    const coursesData: any[] = [];
-    
-    for (const c of allCourses) {
-      try {
-        if (c.data == null) continue;
-        
-        const data = c.data as any;
-        if (!data || typeof data !== 'object') {
-          coursesData.push({
-            id: c.id,
-            title: 'Untitled Course',
-            headline: '',
-            description: '',
-            ecoverUrl: '',
-            status: 'DRAFT',
-            type: 'course',
-            modules: [],
-            totalStudents: 0,
-            rating: 0,
-            _dbId: c.id,
-            _hasFullData: false,
-          });
-          continue;
-        }
-        
-        // Create LIGHTWEIGHT module/lesson structure - NO binary data at all
-        const lightModules = (data.modules || []).map((m: any) => ({
-          id: m.id,
-          title: m.title,
-          lessons: (m.lessons || []).map((l: any) => ({
-            id: l.id,
-            title: l.title,
-            status: l.status,
-            voice: l.voice,
-            duration: l.duration,
-            hostedVideoUrl: l.hostedVideoUrl,
-            videoUrl: l.videoUrl,
-            countsTowardCertificate: l.countsTowardCertificate,
-            // Only indicate if visuals exist, don't include data
-            visualCount: (l.visuals || []).length,
-            hasAudio: !!(l.audioData && l.audioData.length > 100),
-            hasAudioInDb: l.hasAudioInDb === true,
-            hasImagesInDb: l.hasImagesInDb === true,
-            hasRenderedVideo: !!l.renderedVideoUrl,
-            // renderedVideoUrl removed - too large for listing (use course detail endpoint)
-          })),
-        }));
-        
-        // Return only essential fields - NO large data
-        // For covers: include URL if it's a URL, otherwise flag that cover exists in DB
-        const coverUrl = data.ecoverUrl || '';
-        const hasCoverInDb = coverUrl.startsWith('data:') || coverUrl.length > 1000;
-        const safeEcoverUrl = hasCoverInDb ? '' : coverUrl;
-        
-        coursesData.push({
-          id: data.id || c.id,
-          type: data.type || 'course',
-          title: data.title || 'Untitled',
-          headline: data.headline || '',
-          description: (data.description || '').substring(0, 500), // Limit description
-          ecoverUrl: safeEcoverUrl,
-          hasCover: hasCoverInDb || !!safeEcoverUrl, // Flag for lazy loading
-          hasCoverInDb: hasCoverInDb, // Flag to fetch cover from database endpoint
-          status: data.status || 'DRAFT',
-          totalStudents: data.totalStudents || 0,
-          rating: data.rating || 0,
-          modules: lightModules,
-          _dbId: c.id,
-          _hasFullData: false,
-          createdAt: c.createdAt,
-          updatedAt: c.updatedAt,
-        });
-      } catch (courseErr: any) {
-        console.error("Error processing course", c.id, ":", courseErr?.message);
-      }
-    }
-    
-    // CRITICAL: Strip any remaining base64 blobs that may leak through
-    const sanitized = JSON.parse(JSON.stringify(coursesData, (key, value) => {
-      if (typeof value === 'string' && value.length > 50000 && (value.startsWith('data:') || value.startsWith('AAAA'))) {
-        return undefined; // Strip large base64 data
-      }
-      return value;
-    }));
-    const responseSize = JSON.stringify(sanitized).length;
-    console.log("Returning", sanitized.length, "courses, size:", (responseSize / 1024).toFixed(1), "KB");
-    res.json(sanitized);
+    const tBegin = Date.now();
+    const rows = await fetchCourses();
+
+    const coursesData = rows.map((c: any) => {
+      // c.d_modules is already the lightweight shape (built by SQL).
+      const lightModules = Array.isArray(c.d_modules) ? c.d_modules : [];
+
+      const coverUrl = c.d_ecover_url || '';
+      const hasCoverInDb = coverUrl.startsWith('data:') || coverUrl.length > 1000;
+      const safeEcoverUrl = hasCoverInDb ? '' : coverUrl;
+
+      return {
+        id: c.d_id || c.id,
+        type: c.d_type || 'course',
+        title: c.d_title || 'Untitled',
+        headline: c.d_headline || '',
+        description: c.d_description || '',
+        ecoverUrl: safeEcoverUrl,
+        hasCover: hasCoverInDb || !!safeEcoverUrl,
+        hasCoverInDb,
+        status: c.d_status || 'DRAFT',
+        totalStudents: c.d_total_students || 0,
+        rating: c.d_rating || 0,
+        modules: lightModules,
+        _dbId: c.id,
+        _hasFullData: false,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+      };
+    });
+
+    const responseSize = JSON.stringify(coursesData).length;
+    console.log(`GET /api/courses total: ${Date.now() - tBegin}ms, ${coursesData.length} courses, ${(responseSize / 1024).toFixed(1)}KB`);
+
+    // Populate cache for subsequent requests within the TTL window.
+    courseListCache = { payload: coursesData, expiresAt: Date.now() + COURSE_LIST_TTL_MS };
+    res.setHeader('X-Cache', 'MISS');
+    res.json(coursesData);
   } catch (error: any) {
     console.error("Get courses failed after retries:", error?.message || error);
     res.status(500).json({ error: "Failed to get courses" });
   }
 });
 
-app.get("/api/courses/:id", async (req, res) => {
+// IMPORTANT: literal-path routes must come BEFORE /api/courses/:id, otherwise Express
+// matches `:id` to "export-all" and the request hits the wrong handler.
+// P1.3: Streaming ZIP exports via archiver — TTFB drops from "wait for full buffer"
+// to <100ms; supports arbitrarily large exports without buffering in memory.
+app.get("/api/courses/export-all", requireRole("CREATOR"), async (req, res) => {
+  try {
+    console.log("Starting streaming export of all courses...");
+    const allCourses = await db.select().from(courses);
+
+    if (allCourses.length === 0) {
+      return res.status(404).json({ error: "No courses to export" });
+    }
+
+    const filename = `all_courses_backup_${new Date().toISOString().slice(0, 10)}.zip`;
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('warning', (err) => console.warn('archiver warning:', err));
+    archive.on('error', (err) => {
+      console.error('archiver error:', err);
+      try { res.status(500).end(); } catch { /* already sent */ }
+    });
+    archive.pipe(res);
+
+    const coursesData = allCourses.map(c => c.data);
+    archive.append(JSON.stringify(coursesData, null, 2), { name: 'courses.json' });
+
+    for (const course of allCourses) {
+      const courseData = course.data as any;
+      const safeTitle = (courseData.title || 'course').replace(/[^a-z0-9]/gi, '_');
+      archive.append(
+        JSON.stringify(courseData, null, 2),
+        { name: `individual_courses/${safeTitle}.json` }
+      );
+    }
+
+    await archive.finalize();
+    console.log(`Streaming export finalized: ${allCourses.length} courses`);
+  } catch (error: any) {
+    console.error("Export error:", error?.message || error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error?.message || "Failed to export courses" });
+    } else {
+      res.end();
+    }
+  }
+});
+
+app.get("/api/courses/:id/export", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const [course] = await db.select().from(courses).where(eq(courses.id, req.params.id));
+    if (!course) {
+      return res.status(404).json({ error: "Course not found" });
+    }
+
+    const courseData = course.data as any;
+    const safeTitle = (courseData.title || 'course').replace(/[^a-z0-9]/gi, '_');
+    const filename = `${safeTitle}_export.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('warning', (err) => console.warn('archiver warning:', err));
+    archive.on('error', (err) => {
+      console.error('archiver error:', err);
+      try { res.status(500).end(); } catch { /* already sent */ }
+    });
+    archive.pipe(res);
+
+    const { modules, ...metadata } = courseData;
+    archive.append(JSON.stringify(metadata, null, 2), { name: 'course_metadata.json' });
+
+    if (modules && Array.isArray(modules)) {
+      modules.forEach((mod: any, idx: number) => {
+        archive.append(
+          JSON.stringify(mod, null, 2),
+          { name: `modules/module_${idx}_${mod.id || idx}.json` }
+        );
+      });
+    }
+
+    await archive.finalize();
+    console.log(`Streaming export finalized: ${courseData.title}`);
+  } catch (error: any) {
+    console.error("Export error:", error?.message || error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error?.message || "Failed to export course" });
+    } else {
+      res.end();
+    }
+  }
+});
+
+app.get("/api/courses/:id", requireAuth, async (req, res) => {
   try {
     const [course] = await db.select().from(courses).where(eq(courses.id, req.params.id));
     if (!course) return res.status(404).json({ error: "Course not found" });
@@ -1471,7 +2360,7 @@ app.get("/api/courses/:id", async (req, res) => {
 });
 
 // Endpoint to fetch cover image on demand (avoids bloating course list)
-app.get("/api/courses/:id/cover", async (req, res) => {
+app.get("/api/courses/:id/cover", requireAuth, async (req, res) => {
   try {
     const [course] = await db.select().from(courses).where(eq(courses.id, req.params.id));
     if (!course) return res.status(404).json({ error: "Course not found" });
@@ -1489,7 +2378,7 @@ app.get("/api/courses/:id/cover", async (req, res) => {
   }
 });
 
-app.post("/api/courses", async (req, res) => {
+app.post("/api/courses", requireRole("CREATOR"), async (req, res) => {
   try {
     const courseData = req.body;
     console.log("Creating course with data:", { id: courseData.id, title: courseData.title });
@@ -1505,6 +2394,7 @@ app.post("/api/courses", async (req, res) => {
       id: dbId,
       data: extractedData,
     }).returning();
+    invalidateCourseListCache();
     console.log("Course created successfully:", newCourse.id);
     res.json({ ...newCourse.data as object, _dbId: newCourse.id });
   } catch (error: any) {
@@ -1513,7 +2403,7 @@ app.post("/api/courses", async (req, res) => {
   }
 });
 
-app.put("/api/courses/:id", async (req, res) => {
+app.put("/api/courses/:id", requireRole("CREATOR"), async (req, res) => {
   try {
     const courseData = req.body;
     console.log(`PUT /api/courses/${req.params.id} - Starting update`);
@@ -1531,6 +2421,7 @@ app.put("/api/courses/:id", async (req, res) => {
       console.log(`PUT /api/courses/${req.params.id} - Course not found`);
       return res.status(404).json({ error: "Course not found" });
     }
+    invalidateCourseListCache();
     console.log(`PUT /api/courses/${req.params.id} - Update successful`);
     res.json({ ...updated.data as object, _dbId: updated.id });
   } catch (error: any) {
@@ -1539,108 +2430,19 @@ app.put("/api/courses/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/courses/:id", async (req, res) => {
+app.delete("/api/courses/:id", requireRole("CREATOR"), async (req, res) => {
   try {
     await db.delete(courses).where(eq(courses.id, req.params.id));
+    invalidateCourseListCache();
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: "Failed to delete course" });
   }
 });
 
-// ============ SERVER-SIDE EXPORT (Reliable ZIP creation) ============
-
-app.get("/api/courses/export-all", async (req, res) => {
-  try {
-    console.log("Starting server-side export of all courses...");
-    const allCourses = await db.select().from(courses);
-    
-    if (allCourses.length === 0) {
-      return res.status(404).json({ error: "No courses to export" });
-    }
-    
-    const zip = new JSZip();
-    
-    // Export all courses
-    const coursesData = allCourses.map(c => c.data);
-    zip.file("courses.json", JSON.stringify(coursesData, null, 2));
-    
-    // Add individual course files for easier browsing
-    const coursesFolder = zip.folder("individual_courses");
-    if (coursesFolder) {
-      for (const course of allCourses) {
-        const courseData = course.data as any;
-        const safeTitle = (courseData.title || 'course').replace(/[^a-z0-9]/gi, '_');
-        coursesFolder.file(`${safeTitle}.json`, JSON.stringify(courseData, null, 2));
-      }
-    }
-    
-    console.log(`Exporting ${allCourses.length} courses...`);
-    
-    const content = await zip.generateAsync({ 
-      type: "nodebuffer",
-      compression: "DEFLATE",
-      compressionOptions: { level: 6 }
-    });
-    
-    const filename = `all_courses_backup_${new Date().toISOString().slice(0,10)}.zip`;
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', content.length);
-    res.send(content);
-    
-    console.log(`Export complete: ${allCourses.length} courses, ${content.length} bytes`);
-  } catch (error: any) {
-    console.error("Export error:", error?.message || error);
-    res.status(500).json({ error: error?.message || "Failed to export courses" });
-  }
-});
-
-app.get("/api/courses/:id/export", async (req, res) => {
-  try {
-    const [course] = await db.select().from(courses).where(eq(courses.id, req.params.id));
-    if (!course) {
-      return res.status(404).json({ error: "Course not found" });
-    }
-    
-    const courseData = course.data as any;
-    const zip = new JSZip();
-    
-    // Add course metadata
-    const { modules, ...metadata } = courseData;
-    zip.file("course_metadata.json", JSON.stringify(metadata, null, 2));
-    
-    // Add modules
-    const modulesFolder = zip.folder("modules");
-    if (modules && Array.isArray(modules) && modulesFolder) {
-      modules.forEach((mod: any, idx: number) => {
-        modulesFolder.file(`module_${idx}_${mod.id || idx}.json`, JSON.stringify(mod, null, 2));
-      });
-    }
-    
-    const content = await zip.generateAsync({
-      type: "nodebuffer",
-      compression: "DEFLATE",
-      compressionOptions: { level: 6 }
-    });
-    
-    const safeTitle = (courseData.title || 'course').replace(/[^a-z0-9]/gi, '_');
-    const filename = `${safeTitle}_export.zip`;
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Length', content.length);
-    res.send(content);
-    
-    console.log(`Exported course: ${courseData.title}`);
-  } catch (error: any) {
-    console.error("Export error:", error?.message || error);
-    res.status(500).json({ error: error?.message || "Failed to export course" });
-  }
-});
-
 // ============ COURSE UPLOAD (Server-side ZIP processing) ============
 
-app.post("/api/courses/upload", upload.single("file"), async (req, res) => {
+app.post("/api/courses/upload", requireRole("CREATOR"), upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -1750,7 +2552,7 @@ app.post("/api/courses/upload", upload.single("file"), async (req, res) => {
 
 // ============ COURSE IMPORT FROM URL (for large files) ============
 
-app.post("/api/courses/import-url", async (req, res) => {
+app.post("/api/courses/import-url", requireRole("CREATOR"), async (req, res) => {
   try {
     const { url } = req.body;
     
@@ -1874,7 +2676,7 @@ app.post("/api/courses/import-url", async (req, res) => {
 
 // ============ PROGRESS ROUTES ============
 
-app.get("/api/progress", async (req, res) => {
+app.get("/api/progress", requireRole("CREATOR"), async (req, res) => {
   try {
     const allProgress = await db.select().from(progress);
     const progressMap: Record<string, Record<string, string[]>> = {};
@@ -1890,7 +2692,7 @@ app.get("/api/progress", async (req, res) => {
   }
 });
 
-app.get("/api/progress/:userId", async (req, res) => {
+app.get("/api/progress/:userId", requireSelfOrRole("userId", "CREATOR"), async (req, res) => {
   try {
     const userProgress = await db.select().from(progress).where(eq(progress.userId, req.params.userId));
     const progressMap: Record<string, string[]> = {};
@@ -1905,7 +2707,7 @@ app.get("/api/progress/:userId", async (req, res) => {
   }
 });
 
-app.put("/api/progress/:userId/:courseId", async (req, res) => {
+app.put("/api/progress/:userId/:courseId", requireSelfOrRole("userId", "CREATOR"), async (req, res) => {
   try {
     const { completedLessons } = req.body;
     const { userId, courseId } = req.params;
@@ -1933,7 +2735,7 @@ app.put("/api/progress/:userId/:courseId", async (req, res) => {
 
 // ============ TICKETS ROUTES ============
 
-app.get("/api/tickets", async (req, res) => {
+app.get("/api/tickets", requireRole("CREATOR"), async (req, res) => {
   try {
     const allTickets = await db.select().from(tickets);
     res.json(allTickets.map(t => ({
@@ -1945,7 +2747,7 @@ app.get("/api/tickets", async (req, res) => {
   }
 });
 
-app.post("/api/tickets", async (req, res) => {
+app.post("/api/tickets", requireAuth, async (req, res) => {
   try {
     const ticketData = req.body;
     const [newTicket] = await db.insert(tickets).values({
@@ -1966,7 +2768,7 @@ app.post("/api/tickets", async (req, res) => {
   }
 });
 
-app.put("/api/tickets/:id/status", async (req, res) => {
+app.put("/api/tickets/:id/status", requireRole("CREATOR"), async (req, res) => {
   try {
     const { status } = req.body;
     const [updated] = await db.update(tickets)
@@ -1983,7 +2785,7 @@ app.put("/api/tickets/:id/status", async (req, res) => {
 
 // ============ CERTIFICATES ROUTES ============
 
-app.get("/api/certificates", async (req, res) => {
+app.get("/api/certificates", requireAuth, async (req, res) => {
   try {
     const allCerts = await db.select().from(certificates);
     res.json(allCerts.map(c => ({
@@ -1995,7 +2797,7 @@ app.get("/api/certificates", async (req, res) => {
   }
 });
 
-app.post("/api/certificates", async (req, res) => {
+app.post("/api/certificates", requireAuth, async (req, res) => {
   try {
     const certData = req.body;
     const [newCert] = await db.insert(certificates).values({
@@ -2015,7 +2817,7 @@ app.post("/api/certificates", async (req, res) => {
 
 // ============ MIGRATION: Extract embedded media to files ============
 
-app.post("/api/migrate-media", async (req, res) => {
+app.post("/api/migrate-media", requireRole("CREATOR"), async (req, res) => {
   const countFiles = (dir: string) => {
     try {
       return fs.readdirSync(path.join(mediaPath, dir)).length;
@@ -2090,7 +2892,7 @@ app.post("/api/migrate-media", async (req, res) => {
 });
 
 // Migrate a single course by ID
-app.post("/api/migrate-media/:id", async (req, res) => {
+app.post("/api/migrate-media/:id", requireRole("CREATOR"), async (req, res) => {
   try {
     const courseId = req.params.id;
     console.log(`Migrating single course: ${courseId}`);
@@ -2116,7 +2918,7 @@ app.post("/api/migrate-media/:id", async (req, res) => {
 });
 
 // List courses that need migration
-app.get("/api/migrate-media/pending", async (req, res) => {
+app.get("/api/migrate-media/pending", requireRole("CREATOR"), async (req, res) => {
   try {
     const allCourses = await db.select().from(courses);
     const pending: any[] = [];
@@ -2166,7 +2968,7 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
-app.post("/api/ai/generate-image", async (req, res) => {
+app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
   const { prompt, aspectRatio = "16:9" } = req.body;
   
   if (!prompt) {
@@ -2219,7 +3021,7 @@ app.post("/api/ai/generate-image", async (req, res) => {
 
 
 // AI Cover Generation endpoint - generates book covers with Gemini
-app.post("/api/ai/generate-cover", async (req, res) => {
+app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
   const { title, headline, instructions, existingImage } = req.body;
   
   if (!title) {
@@ -2286,7 +3088,7 @@ app.post("/api/ai/generate-cover", async (req, res) => {
 });
 
 // AI Metadata Generation endpoint - generates headlines/descriptions from files
-app.post("/api/ai/generate-metadata", async (req, res) => {
+app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) => {
   const { target, fileData, fileMimeType, coverData } = req.body;
   
   if (!target || (target !== 'headline' && target !== 'description')) {
@@ -2343,7 +3145,7 @@ app.post("/api/ai/generate-metadata", async (req, res) => {
 });
 
 // Simple FLUX test endpoint - generates just 1 test image
-app.post("/api/test-flux", async (req, res) => {
+app.post("/api/test-flux", requireRole("CREATOR"), async (req, res) => {
   const { replicateApiKey } = req.body;
   
   if (!replicateApiKey) {
@@ -2417,7 +3219,7 @@ app.post("/api/test-flux", async (req, res) => {
 });
 
 // AI Text Generation with fallback
-app.post("/api/ai/generate-text", async (req, res) => {
+app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
   const { prompt, jsonMode = false, useOpenAI = false } = req.body;
   
   if (!prompt) {
@@ -2478,7 +3280,7 @@ app.post("/api/ai/generate-text", async (req, res) => {
 
 // ============ TAKEAWAYS GENERATION ============
 
-app.post("/api/ai/generate-takeaways", async (req, res) => {
+app.post("/api/ai/generate-takeaways", requireRole("CREATOR"), async (req, res) => {
   const { script, title } = req.body;
   
   if (!script || script.trim().length < 50) {
@@ -2561,7 +3363,7 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
 
 // ============ RESUME PARSING ============
 
-app.post("/api/ai/parse-resume", async (req, res) => {
+app.post("/api/ai/parse-resume", requireRole("CREATOR"), async (req, res) => {
   const { resumeText } = req.body;
   
   if (!resumeText) {
@@ -2661,7 +3463,7 @@ app.get("/api/health", (req, res) => {
 });
 
 // Database diagnostic endpoint
-app.get("/api/db-info", async (req, res) => {
+app.get("/api/db-info", requireRole("CREATOR"), async (req, res) => {
   try {
     const result = await db.select().from(courses);
     const dbType = process.env.SUPABASE_DATABASE_URL ? 'Supabase' : 'Replit';
@@ -2734,7 +3536,7 @@ const sendEmailWithResend = async (to: string, subject: string, html: string) =>
 };
 
 // Debug endpoint to check SMTP configuration
-app.get("/api/debug/smtp-status", async (req, res) => {
+app.get("/api/debug/smtp-status", requireRole("CREATOR"), async (req, res) => {
   const resendKey = process.env.RESEND_API_KEY;
   res.json({
     resend_api_key_set: !!resendKey,
@@ -2743,7 +3545,7 @@ app.get("/api/debug/smtp-status", async (req, res) => {
 });
 
 // Test email endpoint using Resend
-app.get("/api/debug/test-email", async (req, res) => {
+app.get("/api/debug/test-email", requireRole("CREATOR"), async (req, res) => {
   const resendKey = process.env.RESEND_API_KEY;
   if (!resendKey) {
     return res.json({ success: false, error: "RESEND_API_KEY not set" });
@@ -2781,7 +3583,7 @@ app.get("/api/debug/test-email", async (req, res) => {
 
 
 // Debug endpoint to list ALL users
-app.get("/api/debug/list-all-users", async (req, res) => {
+app.get("/api/debug/list-all-users", requireRole("CREATOR"), async (req, res) => {
   try {
     const allUsers = await db.select({
       id: users.id,
@@ -2797,7 +3599,7 @@ app.get("/api/debug/list-all-users", async (req, res) => {
 });
 
 // Debug endpoint to list students
-app.get("/api/debug/list-students", async (req, res) => {
+app.get("/api/debug/list-students", requireRole("CREATOR"), async (req, res) => {
   try {
     const students = await db.select({
       id: users.id,
@@ -2812,7 +3614,7 @@ app.get("/api/debug/list-students", async (req, res) => {
 });
 
 // Debug endpoint to test sending to any email
-app.get("/api/debug/test-send/:email", async (req, res) => {
+app.get("/api/debug/test-send/:email", requireRole("CREATOR"), async (req, res) => {
   const resendKey = process.env.RESEND_API_KEY;
   const toEmail = req.params.email;
   
@@ -2848,7 +3650,7 @@ app.get("/api/debug/test-send/:email", async (req, res) => {
 });
 
 // Send login credentials to a student
-app.post("/api/students/send-credentials", async (req, res) => {
+app.post("/api/students/send-credentials", requireRole("CREATOR"), async (req, res) => {
   try {
     const { studentId, studentIds } = req.body;
     
@@ -2949,7 +3751,8 @@ app.post("/api/students/send-credentials", async (req, res) => {
 // ============ STATIC FILES (Production) ============
 
 const isProduction = process.env.NODE_ENV === "production";
-const PORT = isProduction ? 5000 : 3001;
+// Honor PORT env var first (Railway/Vercel/Heroku all set this). Fall back to defaults.
+const PORT = parseInt(process.env.PORT || (isProduction ? '5000' : '3001'), 10);
 
 if (isProduction) {
   const distPath = path.join(__dirname, "..", "dist");
@@ -2966,12 +3769,22 @@ if (isProduction) {
 
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`API server running on port ${PORT}`);
-  
+
   // Check Object Storage status at startup
   const storageAvailable = await isObjectStorageConfigured();
   if (storageAvailable) {
     console.log('Media storage: Object Storage (cloud)');
   } else {
     console.log('Media storage: Database (base64) - Object Storage not available');
+  }
+
+  // Prewarm DB connection so the first user-facing request doesn't pay the
+  // SCRAM/TLS handshake cost. Fire-and-forget — failure is non-fatal.
+  try {
+    const t0 = Date.now();
+    await getRawSql()`SELECT 1`;
+    console.log(`DB prewarm: ${Date.now() - t0}ms`);
+  } catch (err) {
+    console.warn('DB prewarm failed:', err);
   }
 });

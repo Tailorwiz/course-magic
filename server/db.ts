@@ -14,14 +14,21 @@ if (!databaseUrl) {
 console.log(`Database: Using Supabase database`);
 
 let queryClient = postgres(databaseUrl, {
-  max: 5,
-  idle_timeout: 10,
+  max: 10,
+  idle_timeout: 300,       // keep connections warm 5 min so requests don't pay reconnect cost
   connect_timeout: 30,
-  max_lifetime: 60 * 5,
+  max_lifetime: 60 * 30,   // recycle connections every 30 min
+  prepare: false,          // pgbouncer transaction-mode doesn't support prepared statements
   ssl: process.env.SUPABASE_DATABASE_URL ? 'require' : undefined,
 });
 
 let db = drizzle(queryClient, { schema });
+
+// Expose the raw postgres client for hot paths that benefit from skipping drizzle's
+// execute() row-iteration overhead (e.g. the lightweight course-list SELECT).
+export function getRawSql() {
+  return queryClient;
+}
 
 export async function getDb() {
   return db;
@@ -40,10 +47,11 @@ export async function reconnectDb() {
   }
   
   queryClient = postgres(dbUrl, {
-    max: 5,
-    idle_timeout: 10,
+    max: 10,
+    idle_timeout: 300,
     connect_timeout: 30,
-    max_lifetime: 60 * 5,
+    max_lifetime: 60 * 30,
+    prepare: false,
     ssl: 'require',
   });
   

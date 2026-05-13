@@ -1,6 +1,45 @@
 import { Course, User, SupportTicket, Certificate, GlobalProgressData, StudentProgress } from './types';
 
 const API_BASE = '/api';
+const TOKEN_KEY = 'authToken';
+
+// ===== Auth token storage =====
+export function getToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
+export function clearToken(): void {
+  setToken(null);
+}
+
+// Wrapper around fetch that auto-attaches Authorization header and dispatches
+// `auth:unauthorized` on 401 so the app can log the user out from a single place.
+export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const token = getToken();
+  const headers = new Headers(init.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const res = await fetch(input, { ...init, headers });
+  if (res.status === 401) {
+    clearToken();
+    window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+  }
+  return res;
+}
 
 interface MediaUploadResult {
   success: boolean;
@@ -21,7 +60,7 @@ async function uploadMediaAsset(type: 'image' | 'audio' | 'video', data: string,
   }
   
   try {
-    const res = await fetch(`${API_BASE}/media/upload`, {
+    const res = await apiFetch(`${API_BASE}/media/upload`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, data, mimeType }),
@@ -88,11 +127,40 @@ async function prepareCourseWithStagedUploads(
     }
   }
   
+  // P0.4: Externalize large base64 renderedVideoUrl to lesson_videos table
+  // (only runs on update where we have a course id; for create, we can't
+  // call lessonVideo.save without an id, so leave the base64 inline and the
+  // post-create code in VideoWizard can move it).
+  const courseId = (prepared as any)._dbId || prepared.id;
+  if (courseId && prepared.modules) {
+    for (let m = 0; m < prepared.modules.length; m++) {
+      const mod = prepared.modules[m];
+      for (let l = 0; l < (mod.lessons || []).length; l++) {
+        const lesson = mod.lessons[l];
+        const rv: string | undefined = lesson.renderedVideoUrl;
+        if (rv && rv.startsWith('data:') && rv.length > 1_000_000) {
+          try {
+            const sizeMB = (rv.length / 1024 / 1024).toFixed(1);
+            console.log(`[P0.4] Externalizing ${sizeMB}MB renderedVideoUrl for lesson ${lesson.id}`);
+            const m1 = /^data:([^;]+);base64,/.exec(rv);
+            const mimeType = m1?.[1] || 'video/webm';
+            await api.lessonVideo.save(courseId, lesson.id, rv, mimeType);
+            lesson.renderedVideoUrl = '';
+            lesson.hasRenderedVideoInDb = true;
+            console.log(`[P0.4] Externalized renderedVideoUrl for lesson ${lesson.id} (${sizeMB}MB removed from JSON)`);
+          } catch (err) {
+            console.warn(`[P0.4] Failed to externalize renderedVideoUrl for lesson ${lesson.id}:`, err);
+          }
+        }
+      }
+    }
+  }
+
   if (mediaItems.length === 0) {
     console.log('No media to upload - saving directly');
     return prepared;
   }
-  
+
   console.log(`Uploading ${mediaItems.length} media assets...`);
   
   for (let i = 0; i < mediaItems.length; i++) {
@@ -161,11 +229,13 @@ function prepareCourseForSave(course: Course): Course {
         if (lesson.thumbnailData) {
           lesson.thumbnailData = '';
         }
-        // IMPORTANT: Preserve renderedVideoUrl reference - it's a URL path, not base64
-        // If it's base64 and large, we should NOT strip it as it's not stored elsewhere
-        // Instead, we'll flag this for the caller to handle
-        if (lesson.renderedVideoUrl && lesson.renderedVideoUrl.length > 1000000) {
-          console.warn(`Large renderedVideoUrl (${(lesson.renderedVideoUrl.length / 1024 / 1024).toFixed(2)}MB) - preserved but may cause issues`);
+        // P0.4: If renderedVideoUrl wasn't externalized in prepareCourseWithStagedUploads
+        // (e.g. course had no id at the time), clear it now to prevent payload bloat.
+        // The student player falls back to live audio+images automatically.
+        if (lesson.renderedVideoUrl && lesson.renderedVideoUrl.startsWith('data:') &&
+            lesson.renderedVideoUrl.length > 1_000_000) {
+          console.warn(`[P0.4] Stripping ${(lesson.renderedVideoUrl.length / 1024 / 1024).toFixed(2)}MB inline renderedVideoUrl from lesson ${lesson.id} (was not externalized — re-render to restore)`);
+          lesson.renderedVideoUrl = '';
         }
       }
     }
@@ -216,38 +286,54 @@ export const api = {
   auth: {
     async login(email: string, password: string): Promise<User | null> {
       try {
-        const res = await fetch(`${API_BASE}/auth/login`, {
+        const res = await apiFetch(`${API_BASE}/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, password }),
         });
+        if (!res.ok) return null;
+        const data = await res.json() as { user: User; token: string };
+        if (data.token) setToken(data.token);
+        return data.user;
+      } catch {
+        return null;
+      }
+    },
+    async register(user: Partial<User> & { password: string }): Promise<User> {
+      const res = await apiFetch(`${API_BASE}/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(user),
+      });
+      const data = await handleResponse<{ user: User; token: string }>(res);
+      if (data.token) setToken(data.token);
+      return data.user;
+    },
+    async me(): Promise<User | null> {
+      try {
+        const res = await apiFetch(`${API_BASE}/auth/me`);
         if (!res.ok) return null;
         return res.json();
       } catch {
         return null;
       }
     },
-    async register(user: Partial<User> & { password: string }): Promise<User> {
-      const res = await fetch(`${API_BASE}/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(user),
-      });
-      return handleResponse<User>(res);
+    logout(): void {
+      clearToken();
     },
   },
 
   users: {
     async getAll(): Promise<User[]> {
-      const res = await fetch(`${API_BASE}/users`);
+      const res = await apiFetch(`${API_BASE}/users`);
       return handleResponse<User[]>(res);
     },
     async get(id: string): Promise<User> {
-      const res = await fetch(`${API_BASE}/users/${id}`);
+      const res = await apiFetch(`${API_BASE}/users/${id}`);
       return handleResponse<User>(res);
     },
     async update(id: string, data: Partial<User>): Promise<User> {
-      const res = await fetch(`${API_BASE}/users/${id}`, {
+      const res = await apiFetch(`${API_BASE}/users/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
@@ -255,22 +341,22 @@ export const api = {
       return handleResponse<User>(res);
     },
     async delete(id: string): Promise<void> {
-      await fetch(`${API_BASE}/users/${id}`, { method: 'DELETE' });
+      await apiFetch(`${API_BASE}/users/${id}`, { method: 'DELETE' });
     },
   },
 
   courses: {
     async getAll(): Promise<Course[]> {
-      const res = await fetch(`${API_BASE}/courses`);
+      const res = await apiFetch(`${API_BASE}/courses`);
       return handleResponse<Course[]>(res);
     },
     async get(id: string): Promise<Course> {
-      const res = await fetch(`${API_BASE}/courses/${id}`);
+      const res = await apiFetch(`${API_BASE}/courses/${id}`);
       return handleResponse<Course>(res);
     },
     async getCover(id: string): Promise<string | null> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${id}/cover`);
+        const res = await apiFetch(`${API_BASE}/courses/${id}/cover`);
         if (!res.ok) return null;
         const data = await res.json();
         return data.ecoverUrl || null;
@@ -296,7 +382,7 @@ export const api = {
           const fallbackBody = JSON.stringify(fallbackCourse);
           console.log(`Fallback payload size: ${(fallbackBody.length / 1024 / 1024).toFixed(2)} MB`);
           
-          const res = await fetch(`${API_BASE}/courses`, {
+          const res = await apiFetch(`${API_BASE}/courses`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: fallbackBody,
@@ -306,7 +392,7 @@ export const api = {
           return handleResponse<Course>(res);
         }
         
-        const res = await fetch(`${API_BASE}/courses`, {
+        const res = await apiFetch(`${API_BASE}/courses`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: bodyStr,
@@ -340,7 +426,7 @@ export const api = {
           const fallbackBody = JSON.stringify(fallbackCourse);
           console.log(`Fallback payload size: ${(fallbackBody.length / 1024 / 1024).toFixed(2)} MB`);
           
-          const res = await fetch(`${API_BASE}/courses/${id}`, {
+          const res = await apiFetch(`${API_BASE}/courses/${id}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: fallbackBody,
@@ -350,7 +436,7 @@ export const api = {
           return handleResponse<Course>(res);
         }
         
-        const res = await fetch(`${API_BASE}/courses/${id}`, {
+        const res = await apiFetch(`${API_BASE}/courses/${id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: bodyStr,
@@ -367,13 +453,13 @@ export const api = {
       }
     },
     async delete(id: string): Promise<void> {
-      await fetch(`${API_BASE}/courses/${id}`, { method: 'DELETE' });
+      await apiFetch(`${API_BASE}/courses/${id}`, { method: 'DELETE' });
     },
     async uploadZip(file: File, onProgress?: (progress: number) => void): Promise<{ success: boolean; courses?: Course[]; course?: Course; count?: number }> {
       const formData = new FormData();
       formData.append('file', file);
       
-      const res = await fetch(`${API_BASE}/courses/upload`, {
+      const res = await apiFetch(`${API_BASE}/courses/upload`, {
         method: 'POST',
         body: formData,
       });
@@ -384,15 +470,15 @@ export const api = {
 
   progress: {
     async getAll(): Promise<GlobalProgressData> {
-      const res = await fetch(`${API_BASE}/progress`);
+      const res = await apiFetch(`${API_BASE}/progress`);
       return handleResponse<GlobalProgressData>(res);
     },
     async getForUser(userId: string): Promise<StudentProgress> {
-      const res = await fetch(`${API_BASE}/progress/${userId}`);
+      const res = await apiFetch(`${API_BASE}/progress/${userId}`);
       return handleResponse<StudentProgress>(res);
     },
     async update(userId: string, courseId: string, completedLessons: string[]): Promise<void> {
-      await fetch(`${API_BASE}/progress/${userId}/${courseId}`, {
+      await apiFetch(`${API_BASE}/progress/${userId}/${courseId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ completedLessons }),
@@ -402,11 +488,11 @@ export const api = {
 
   tickets: {
     async getAll(): Promise<SupportTicket[]> {
-      const res = await fetch(`${API_BASE}/tickets`);
+      const res = await apiFetch(`${API_BASE}/tickets`);
       return handleResponse<SupportTicket[]>(res);
     },
     async create(ticket: SupportTicket): Promise<SupportTicket> {
-      const res = await fetch(`${API_BASE}/tickets`, {
+      const res = await apiFetch(`${API_BASE}/tickets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(ticket),
@@ -414,7 +500,7 @@ export const api = {
       return handleResponse<SupportTicket>(res);
     },
     async updateStatus(id: string, status: 'open' | 'resolved'): Promise<void> {
-      await fetch(`${API_BASE}/tickets/${id}/status`, {
+      await apiFetch(`${API_BASE}/tickets/${id}/status`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
@@ -424,11 +510,11 @@ export const api = {
 
   certificates: {
     async getAll(): Promise<Certificate[]> {
-      const res = await fetch(`${API_BASE}/certificates`);
+      const res = await apiFetch(`${API_BASE}/certificates`);
       return handleResponse<Certificate[]>(res);
     },
     async create(cert: Omit<Certificate, 'id' | 'issueDate'>): Promise<Certificate> {
-      const res = await fetch(`${API_BASE}/certificates`, {
+      const res = await apiFetch(`${API_BASE}/certificates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cert),
@@ -440,7 +526,7 @@ export const api = {
   lessonAudio: {
     async save(courseId: string, lessonId: string, audioData: string, mimeType?: string, wordTimestamps?: Array<{word: string, start: number, end: number}>): Promise<{ success: boolean }> {
       console.log(`Saving audio directly to database: courseId=${courseId}, lessonId=${lessonId}, size=${(audioData.length / 1024 / 1024).toFixed(2)}MB`);
-      const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio`, {
+      const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioData, mimeType, wordTimestamps }),
@@ -449,7 +535,7 @@ export const api = {
     },
     async get(courseId: string, lessonId: string): Promise<{ audioData: string; mimeType: string; wordTimestamps: Array<{word: string, start: number, end: number}> } | null> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio`);
         if (res.status === 404) return null;
         return handleResponse<{ audioData: string; mimeType: string; wordTimestamps: Array<{word: string, start: number, end: number}> }>(res);
       } catch {
@@ -458,11 +544,39 @@ export const api = {
     },
     async exists(courseId: string, lessonId: string): Promise<boolean> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio/exists`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio/exists`);
         const data = await res.json();
         return data.exists || false;
       } catch {
         return false;
+      }
+    },
+    // P0.1: Build a streaming URL the <audio> tag can use directly.
+    // The token is in the query string because <audio> can't set headers.
+    streamUrl(courseId: string, lessonId: string): string {
+      const t = getToken();
+      const tokenParam = t ? `?token=${encodeURIComponent(t)}` : '';
+      return `${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio/stream${tokenParam}`;
+    },
+    async getTimestamps(courseId: string, lessonId: string): Promise<{ mimeType: string; wordTimestamps: Array<{word: string, start: number, end: number}> } | null> {
+      try {
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio/timestamps`);
+        if (res.status === 404) return null;
+        return handleResponse<{ mimeType: string; wordTimestamps: Array<{word: string, start: number, end: number}> }>(res);
+      } catch {
+        return null;
+      }
+    },
+    // P2.3: Backfill word-level timestamps via OpenAI Whisper for lessons whose audio
+    // came from a TTS provider that didn't return them (e.g. Gemini).
+    async align(courseId: string, lessonId: string): Promise<{ success: boolean; wordCount: number; elapsedMs: number; audioMB: number; transcriptPreview?: string } | null> {
+      try {
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/audio/align`, {
+          method: 'POST',
+        });
+        return handleResponse<any>(res);
+      } catch (e) {
+        return null;
       }
     },
   },
@@ -470,7 +584,7 @@ export const api = {
   lessonImages: {
     async save(courseId: string, lessonId: string, images: Array<{visualIndex: number, imageData: string, prompt?: string}>): Promise<{ success: boolean; count: number }> {
       console.log(`Saving ${images.length} images to database: courseId=${courseId}, lessonId=${lessonId}`);
-      const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images`, {
+      const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ images }),
@@ -480,7 +594,7 @@ export const api = {
     async get(courseId: string, lessonId: string): Promise<Array<{visualIndex: number, imageData: string, prompt?: string}>> {
       try {
         console.log(`[API lessonImages.get] Fetching from: ${API_BASE}/courses/${courseId}/lessons/${lessonId}/images`);
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images`);
         console.log(`[API lessonImages.get] Response status: ${res.status}`);
         if (res.status === 404) return [];
         const data = await handleResponse<Array<{visualIndex: number, imageData: string, prompt?: string}>>(res);
@@ -493,7 +607,7 @@ export const api = {
     },
     async exists(courseId: string, lessonId: string): Promise<{ exists: boolean; count: number }> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/exists`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/exists`);
         const data = await res.json();
         return { exists: data.exists || false, count: data.count || 0 };
       } catch {
@@ -502,7 +616,7 @@ export const api = {
     },
     async getOne(courseId: string, lessonId: string, visualIndex: number): Promise<{visualIndex: number, imageData: string, prompt?: string} | null> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/${visualIndex}`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/${visualIndex}`);
         if (res.status === 404) return null;
         return res.json();
       } catch {
@@ -511,11 +625,43 @@ export const api = {
     },
     async getMetadata(courseId: string, lessonId: string): Promise<Array<{visualIndex: number, prompt?: string}>> {
       try {
-        const res = await fetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/metadata`);
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/metadata`);
         if (res.status === 404) return [];
         return res.json();
       } catch {
         return [];
+      }
+    },
+    // P0.2: Build a streaming URL for an <img> tag. Token in query because <img> can't set headers.
+    streamUrl(courseId: string, lessonId: string, visualIndex: number | string): string {
+      const t = getToken();
+      const tokenParam = t ? `?token=${encodeURIComponent(t)}` : '';
+      return `${API_BASE}/courses/${courseId}/lessons/${lessonId}/images/${visualIndex}/stream${tokenParam}`;
+    },
+  },
+
+  // P0.4: Rendered MP4/WebM videos stored separately from course JSON.
+  lessonVideo: {
+    async save(courseId: string, lessonId: string, videoData: string, mimeType?: string): Promise<{ success: boolean }> {
+      const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/video`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoData, mimeType }),
+      });
+      return handleResponse<{ success: boolean }>(res);
+    },
+    streamUrl(courseId: string, lessonId: string): string {
+      const t = getToken();
+      const tokenParam = t ? `?token=${encodeURIComponent(t)}` : '';
+      return `${API_BASE}/courses/${courseId}/lessons/${lessonId}/video/stream${tokenParam}`;
+    },
+    async exists(courseId: string, lessonId: string): Promise<boolean> {
+      try {
+        const res = await apiFetch(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/video/exists`);
+        const data = await res.json();
+        return data.exists || false;
+      } catch {
+        return false;
       }
     },
   },
@@ -527,7 +673,7 @@ export const api = {
       options: { useOpenAI?: boolean; useFlux?: boolean; useFluxSchnell?: boolean; useNanoBanana?: boolean; replicateApiKey?: string; openaiApiKey?: string } = {}
     ): Promise<{ imageData: string; provider: string; success: boolean }> {
       const { useOpenAI = false, useFlux = false, useFluxSchnell = false, useNanoBanana = false, replicateApiKey, openaiApiKey } = options;
-      const res = await fetch(`${API_BASE}/ai/generate-image`, {
+      const res = await apiFetch(`${API_BASE}/ai/generate-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, aspectRatio, useOpenAI, useFlux, useFluxSchnell, useNanoBanana, replicateApiKey, openaiApiKey }),
@@ -535,7 +681,7 @@ export const api = {
       return handleResponse<{ imageData: string; provider: string; success: boolean }>(res);
     },
     async generateText(prompt: string, jsonMode: boolean = false, useOpenAI: boolean = false): Promise<{ text: string; provider: string; success: boolean }> {
-      const res = await fetch(`${API_BASE}/ai/generate-text`, {
+      const res = await apiFetch(`${API_BASE}/ai/generate-text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, jsonMode, useOpenAI }),
@@ -546,7 +692,7 @@ export const api = {
 
   async testFlux(replicateApiKey: string): Promise<{ success: boolean; message?: string; error?: string; imageData?: string }> {
     try {
-      const res = await fetch(`${API_BASE}/test-flux`, {
+      const res = await apiFetch(`${API_BASE}/test-flux`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ replicateApiKey }),

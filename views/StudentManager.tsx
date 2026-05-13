@@ -3,6 +3,7 @@ import { User, Course, UserRole, GlobalProgressData, Certificate, SupportTicket 
 import { Button } from '../components/Button';
 import { Input } from '../components/Input';
 import { Plus, Search, Trash2, Mail, Lock, User as UserIcon, Phone, MapPin, UploadCloud, Edit3, CheckSquare, Square, RefreshCcw, Download, ChevronUp, ChevronDown, BookOpen, FileText, Wand2, Loader2, Send, ChevronRight } from 'lucide-react';
+import { apiFetch } from '../api';
 
 interface StudentExportData {
     user: User;
@@ -99,7 +100,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({
         setParseError('');
         
         try {
-            const response = await fetch('/api/ai/parse-resume', {
+            const response = await apiFetch('/api/ai/parse-resume', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ resumeText: resumeText.trim() })
@@ -382,7 +383,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({
     const sendCredentials = async (studentId: string) => {
         setSendingCredentials(prev => [...prev, studentId]);
         try {
-            const response = await fetch('/api/students/send-credentials', {
+            const response = await apiFetch('/api/students/send-credentials', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ studentId })
@@ -411,7 +412,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({
         }
         setSendingCredentials(selectedStudentIds);
         try {
-            const response = await fetch('/api/students/send-credentials', {
+            const response = await apiFetch('/api/students/send-credentials', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ studentIds: selectedStudentIds })

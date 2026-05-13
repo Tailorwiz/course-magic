@@ -1,14 +1,17 @@
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Course } from '../types';
-import { X, Layers, FileText, Users, Clock } from 'lucide-react';
+import { X, Layers, FileText, Users, Clock, Film, Loader2, CheckCircle2 } from 'lucide-react';
+import { apiFetch } from '../api';
 
 interface CourseDetailsModalProps {
   course: Course;
   onClose: () => void;
+  // Caller may show this in CREATOR mode (renders the per-lesson "Render to MP4" button).
+  isCreatorView?: boolean;
 }
 
-export const CourseDetailsModal: React.FC<CourseDetailsModalProps> = ({ course, onClose }) => {
+export const CourseDetailsModal: React.FC<CourseDetailsModalProps> = ({ course, onClose, isCreatorView = false }) => {
   const totalLessons = course.modules.reduce((acc, m) => acc + m.lessons.length, 0);
   
   // Calculate total duration in seconds across all lessons
@@ -24,6 +27,43 @@ export const CourseDetailsModal: React.FC<CourseDetailsModalProps> = ({ course, 
     : `${minutes}m`;
 
   const isGenericHeadline = !course.headline || course.headline === 'AI Generated Video' || course.headline === 'Generated Course';
+
+  // Per-lesson rendering state (creator view only). Keyed by lesson id.
+  type RenderState = { status: 'idle' | 'running' | 'done' | 'error'; message?: string; mp4MB?: number };
+  const [renderState, setRenderState] = useState<Record<string, RenderState>>({});
+  // Locally track which lessons have a rendered MP4 so the UI updates without a parent refresh.
+  const [renderedLessons, setRenderedLessons] = useState<Set<string>>(() => {
+    const s = new Set<string>();
+    for (const m of course.modules) for (const l of m.lessons) {
+      if ((l as any).hasRenderedVideoInDb || (l as any).hasRenderedVideo) s.add(l.id);
+    }
+    return s;
+  });
+
+  const courseDbId = (course as any)._dbId || course.id;
+
+  const handleRender = async (lessonId: string) => {
+    setRenderState(prev => ({ ...prev, [lessonId]: { status: 'running', message: 'Rendering MP4 (≈ lesson duration)…' } }));
+    try {
+      const res = await apiFetch(`/api/courses/${courseDbId}/lessons/${lessonId}/render-mp4`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setRenderState(prev => ({
+        ...prev,
+        [lessonId]: { status: 'done', message: `Rendered ${data.mp4MB ?? '?'} MB MP4`, mp4MB: data.mp4MB },
+      }));
+      setRenderedLessons(prev => { const s = new Set(prev); s.add(lessonId); return s; });
+    } catch (e: any) {
+      setRenderState(prev => ({ ...prev, [lessonId]: { status: 'error', message: e?.message || 'Render failed' } }));
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in" onClick={onClose}>
@@ -122,13 +162,46 @@ export const CourseDetailsModal: React.FC<CourseDetailsModalProps> = ({ course, 
                                 </div>
                                 <div className="bg-white px-4 py-3">
                                     <ul className="space-y-2">
-                                        {mod.lessons.slice(0, 3).map((l, i) => (
-                                            <li key={l.id} className="text-xs text-slate-500 flex items-center gap-2">
-                                                <div className="w-1.5 h-1.5 rounded-full bg-indigo-200 flex-shrink-0"></div>
-                                                <span className="truncate">{l.title}</span>
-                                            </li>
-                                        ))}
-                                        {mod.lessons.length > 3 && (
+                                        {(isCreatorView ? mod.lessons : mod.lessons.slice(0, 3)).map((l, i) => {
+                                            const rs = renderState[l.id] || { status: 'idle' as const };
+                                            const isRendered = renderedLessons.has(l.id);
+                                            return (
+                                                <li key={l.id} className="text-xs flex items-center gap-2 py-1">
+                                                    <div className="w-1.5 h-1.5 rounded-full bg-indigo-200 flex-shrink-0"></div>
+                                                    <span className="truncate flex-1 text-slate-600">{l.title}</span>
+                                                    {isCreatorView && (
+                                                        <div className="flex items-center gap-2 flex-shrink-0">
+                                                            {isRendered ? (
+                                                                <span className="inline-flex items-center gap-1 text-emerald-600 text-[11px] font-semibold">
+                                                                    <CheckCircle2 size={12} /> MP4 ready
+                                                                </span>
+                                                            ) : null}
+                                                            <button
+                                                                disabled={rs.status === 'running'}
+                                                                onClick={(e) => { e.stopPropagation(); handleRender(l.id); }}
+                                                                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold transition-colors ${
+                                                                    rs.status === 'running'
+                                                                        ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                                                                        : rs.status === 'error'
+                                                                            ? 'bg-red-50 text-red-700 hover:bg-red-100'
+                                                                            : isRendered
+                                                                                ? 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                                                                : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                                                                }`}
+                                                                title={rs.message || (isRendered ? 'Re-render this lesson' : 'Bake audio + images into a single MP4')}
+                                                            >
+                                                                {rs.status === 'running' ? (
+                                                                    <><Loader2 size={12} className="animate-spin" /> Rendering…</>
+                                                                ) : (
+                                                                    <><Film size={12} /> {isRendered ? 'Re-render' : 'Render to MP4'}</>
+                                                                )}
+                                                            </button>
+                                                        </div>
+                                                    )}
+                                                </li>
+                                            );
+                                        })}
+                                        {!isCreatorView && mod.lessons.length > 3 && (
                                             <li className="text-xs text-indigo-500 font-medium pl-3.5 pt-1">+ {mod.lessons.length - 3} more lessons</li>
                                         )}
                                         {mod.lessons.length === 0 && (

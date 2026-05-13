@@ -7,7 +7,7 @@ import { Course, CourseStatus, LessonStatus, VisualAsset, VoiceOption, CaptionSt
 import { GoogleGenAI, Modality, GenerateContentResponse, Type } from "@google/genai";
 import { pcmToWav, createSolidColorImage, exportVideoAssetsZip, safeExportCourse, getAudioDurationFromBlob, renderVideoFromLesson, downloadBlob, convertPdfToImages, compressBase64Image } from '../utils';
 import { DEFAULT_ELEVEN_LABS_KEY } from '../constants';
-import { api } from '../api';
+import { api, apiFetch } from '../api';
 
 interface VideoWizardProps {
   onCancel: () => void;
@@ -1614,7 +1614,7 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
         if (isElevenLabs && elevenLabsApiKey) {
             try {
                 console.log(`Generating audio with ElevenLabs via backend: voiceId=${voiceId}`);
-                const response = await fetch('/api/tts/elevenlabs', {
+                const response = await apiFetch('/api/tts/elevenlabs', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -1664,7 +1664,7 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
             setStatusMessage('Generating voice audio...');
             
             const response = await withRetry(async () => {
-                const res = await fetch('/api/tts/gemini', {
+                const res = await apiFetch('/api/tts/gemini', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ text: cleanText, voiceId })
@@ -2141,6 +2141,13 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
                 section.startTime = section.startTime * scaleFactor;
                 section.endTime = section.endTime * scaleFactor;
               }
+              // P0.3 fix: scale word timestamps too, otherwise captions drift relative to audio
+              // after the rescale (visuals shifted but words didn't).
+              for (const ts of wordTimestamps) {
+                ts.start = ts.start * scaleFactor;
+                ts.end = ts.end * scaleFactor;
+              }
+              console.log(`Rescaled ${wordTimestamps.length} word timestamps by ${scaleFactor.toFixed(3)}`);
               // Update durationSeconds to actual
               cumulativeTime = actualCombinedDuration;
             }
@@ -2281,7 +2288,7 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
           const base64Data = await base64Promise;
           
           // Upload to server
-          const uploadResponse = await fetch('/api/media/upload', {
+          const uploadResponse = await apiFetch('/api/media/upload', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'video', data: base64Data, mimeType: 'video/webm' })
@@ -3179,10 +3186,10 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
                                                     {vis.imageData ? (
                                                         <>
                                                             {/* Container for image + subtitle bar preview */}
-                                                            <div className="w-full h-full flex flex-col" onClick={() => setPreviewImageUrl(vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`)}>
+                                                            <div className="w-full h-full flex flex-col" onClick={() => setPreviewImageUrl(vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('/api/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`)}>
                                                                 {/* Video content area - reduced when subtitle bar is enabled */}
                                                                 <div className={`${captionMode === 'Subtitle Bar' && showSubtitles && getEffectiveSetting(selectedCaptionStyle, 'captionStyle') !== 'None' ? 'flex-[88.89]' : 'flex-1'} relative overflow-hidden`}>
-                                                                    <img src={vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`} className="w-full h-full object-contain" />
+                                                                    <img src={vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('/api/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`} className="w-full h-full object-contain" />
                                                                 </div>
                                                                 {/* Subtitle bar - 11.11% of height (120/1080 ≈ 11.11%) */}
                                                                 {captionMode === 'Subtitle Bar' && showSubtitles && getEffectiveSetting(selectedCaptionStyle, 'captionStyle') !== 'None' && (

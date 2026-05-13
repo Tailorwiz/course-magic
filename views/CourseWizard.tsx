@@ -7,7 +7,7 @@ import { Course, CourseStatus, Module, Lesson, LessonStatus, VisualAsset, VoiceO
 import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
 import { pcmToWav, createSolidColorImage, exportVideoAssetsZip, safeExportCourse, getAudioDurationFromBlob, renderVideoFromLesson, downloadBlob, convertPdfToImages, compressBase64Image } from '../utils';
 import { MOCK_COURSE, CURRENT_USER, DEFAULT_ELEVEN_LABS_KEY } from '../constants';
-import { api } from '../api';
+import { api, apiFetch } from '../api';
 
 interface CourseWizardProps {
   initialCourse?: Course;
@@ -428,7 +428,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
       if (!courseDetails.title) { alert("Title required."); return; }
       setIsGeneratingEcover(true);
       try {
-           const response = await fetch('/api/ai/generate-cover', {
+           const response = await apiFetch('/api/ai/generate-cover', {
              method: 'POST',
              headers: { 'Content-Type': 'application/json' },
              body: JSON.stringify({
@@ -465,7 +465,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
           // Get cover data if available
           const coverData = ecoverPreview && ecoverPreview.startsWith('data:') && ecoverPreview.includes('base64') ? ecoverPreview : undefined;
           
-          const response = await fetch('/api/ai/generate-metadata', {
+          const response = await apiFetch('/api/ai/generate-metadata', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ target, fileData, fileMimeType, coverData })
@@ -1830,14 +1830,26 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                                                          </div>
                                                          
                                                          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                                                             {lesson.visuals?.map((vis, vIdx) => (
+                                                             {lesson.visuals?.map((vis, vIdx) => {
+                                                                 // Photos hydration fix: when the lesson's images live in lesson_images / Supabase Storage,
+                                                                 // visual.imageData is empty. Build the streaming URL instead so <img src> works.
+                                                                 const courseDbId = (course as any)?._dbId || course?.id;
+                                                                 const lessonHasMigratedImages = (lesson as any).hasImagesInDb === true;
+                                                                 const resolvedSrc = vis.imageData
+                                                                     ? (vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('/api/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:')
+                                                                         ? vis.imageData
+                                                                         : `data:image/png;base64,${vis.imageData}`)
+                                                                     : (lessonHasMigratedImages && courseDbId && lesson.id
+                                                                         ? api.lessonImages.streamUrl(courseDbId, lesson.id, vIdx)
+                                                                         : '');
+                                                                 return (
                                                                  <div key={vis.id} className="border border-slate-200 rounded-lg overflow-hidden bg-white shadow-sm hover:shadow-md transition-shadow">
                                                                      <div className="aspect-video bg-slate-100 relative group">
-                                                                         {vis.imageData ? (
-                                                                             <img 
-                                                                                src={vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`} 
+                                                                         {resolvedSrc ? (
+                                                                             <img
+                                                                                src={resolvedSrc}
                                                                                 className="w-full h-full object-cover cursor-pointer"
-                                                                                onClick={() => setPreviewImageUrl(vis.imageData.startsWith('/media/') || vis.imageData.startsWith('/objects/') || vis.imageData.startsWith('http') || vis.imageData.startsWith('data:') ? vis.imageData : `data:image/png;base64,${vis.imageData}`)}
+                                                                                onClick={() => setPreviewImageUrl(resolvedSrc)}
                                                                              />
                                                                          ) : (
                                                                              <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
@@ -1895,7 +1907,8 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                                                                          </div>
                                                                      </div>
                                                                  </div>
-                                                             ))}
+                                                                 );
+                                                             })}
                                                          </div>
                                                      </div>
 

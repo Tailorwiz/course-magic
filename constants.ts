@@ -2,13 +2,17 @@
 import { Course, CourseStatus, LessonStatus, User, UserRole, VisualAsset } from './types';
 import { createSolidColorImage } from './utils';
 
-export const DEFAULT_ELEVEN_LABS_KEY = 'sk_50f18ecb4c9094e03136ddb8f9f11ac28081da1e0c2e5258';
+// ElevenLabs API key is now server-side only (see ELEVENLABS_API_KEY in .env).
+// This empty default is kept so existing settings code doesn't break — when blank,
+// the server uses its env key instead. Pasting a key in the Settings UI overrides it.
+export const DEFAULT_ELEVEN_LABS_KEY = '';
 
+// Placeholder user shape used as a TS type reference and as a default avatar fallback.
+// Authentication is server-side; passwords NEVER live in client code.
 export const CURRENT_USER: User = {
   id: 'u1',
   name: 'Marcus Hall',
   email: 'marcus@tailorwiz.com',
-  password: 'admin123',
   role: UserRole.CREATOR,
   avatarUrl: 'https://ui-avatars.com/api/?name=Marcus+Hall&background=0D9488&color=fff'
 };
@@ -17,7 +21,6 @@ export const DEFAULT_STUDENT: User = {
   id: 's1',
   name: 'John Doe',
   email: 'john@example.com',
-  password: 'password',
   role: UserRole.STUDENT,
   avatarUrl: 'https://ui-avatars.com/api/?name=John+Doe&background=random',
   assignedCourseIds: ['c1']

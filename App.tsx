@@ -26,7 +26,7 @@ import { safeExportCourse, stripHeavyAssets, exportCourseAsZip, exportAllDataAsZ
 import { Input, TextArea } from './components/Input';
 import { Button } from './components/Button';
 import { GoogleGenAI } from "@google/genai";
-import { api } from './api';
+import { api, apiFetch, clearToken, getToken } from './api';
 
 const formatDuration = (totalSeconds: number): string => {
   if (!totalSeconds || totalSeconds <= 0) return '';
@@ -106,6 +106,26 @@ export const App = () => {
       localStorage.removeItem('currentUser');
     }
   }, [currentUser]);
+
+  // On startup: if we have a stored user but no JWT (e.g. old session), or if the
+  // stored user is stale, validate via /api/auth/me. Log out cleanly on 401.
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      console.log('[Auth] 401 received — clearing session');
+      clearToken();
+      setCurrentUser(null);
+    };
+    window.addEventListener('auth:unauthorized', handleUnauthorized);
+
+    // If user is restored from localStorage but no token exists, force re-login
+    if (currentUser && !getToken()) {
+      console.log('[Auth] Stored user but no JWT — forcing re-login');
+      setCurrentUser(null);
+    }
+
+    return () => window.removeEventListener('auth:unauthorized', handleUnauthorized);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   
   // Data State
   const [courses, setCourses] = useState<Course[]>([]);
@@ -140,7 +160,7 @@ export const App = () => {
       // If cover is in database and we haven't started fetching
       if (hasCoverInDb && !coverFetchingRef.current.has(courseId)) {
         coverFetchingRef.current.add(courseId);
-        fetch(`/api/courses/${courseId}/cover`)
+        apiFetch(`/api/courses/${courseId}/cover`)
           .then(res => res.ok ? res.json() : null)
           .then(data => {
             if (data?.ecoverUrl) {
@@ -284,6 +304,7 @@ export const App = () => {
   };
 
   const handleLogout = () => {
+      clearToken();
       setCurrentUser(null);
       setCurrentView('dashboard');
   };

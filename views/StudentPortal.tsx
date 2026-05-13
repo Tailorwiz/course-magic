@@ -5,7 +5,7 @@ import { Button } from '../components/Button';
 import { ChevronLeft, ChevronRight, PlayCircle, PauseCircle, CheckCircle2, Award, Volume2, Maximize, Minimize, SkipBack, SkipForward, ArrowLeft, Menu, X, FileText, Download, Loader2, Link as LinkIcon, BookOpen, ChevronDown, ChevronUp, Image as ImageIcon, Circle, Play, Clock, Layout, MessageCircle, Send, Sparkles, Lightbulb, CheckSquare, AlertCircle } from 'lucide-react';
 import { pcmToWav, renderVideoFromLesson, downloadBlob } from '../utils';
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
-import { api } from '../api';
+import { api, apiFetch, getToken } from '../api';
 
 interface WordTiming {
     word: string;
@@ -122,7 +122,7 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         const hasCoverInDb = (course as any).hasCoverInDb;
         if (hasCoverInDb && coverFetchedRef.current !== courseId) {
             coverFetchedRef.current = courseId;
-            fetch(`/api/courses/${courseId}/cover`)
+            apiFetch(`/api/courses/${courseId}/cover`)
                 .then(res => res.ok ? res.json() : null)
                 .then(data => {
                     if (data?.ecoverUrl) {
@@ -139,6 +139,9 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
     const [hostedVideoFailed, setHostedVideoFailed] = useState(false);
     const [fetchedVisuals, setFetchedVisuals] = useState<Record<string, any[]>>({});
     const [imageMetadata, setImageMetadata] = useState<Record<string, Array<{visualIndex: number, prompt?: string}>>>({});
+    // For each lesson, remember which (courseId, lessonId) pair its images actually live under.
+    // ~30% of lessons store their images under sourceVideoId/sourceLessonId, not their own ID.
+    const [imageSource, setImageSource] = useState<Record<string, { courseId: string; lessonId: string }>>({});
     const [loadedImages, setLoadedImages] = useState<Record<string, Record<number, string>>>({}); // lessonId -> visualIndex -> imageData
     const fetchingImagesRef = useRef<Set<string>>(new Set()); // Track in-progress fetches
     const playerContainerRef = useRef<HTMLDivElement>(null);
@@ -213,9 +216,20 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         return { ...rawLesson, visuals: mergedVisuals };
     }, [rawLesson, fetchedVisuals]);
     
-    // Check if lesson has a streamable video URL (hosted or rendered)
-    const streamableVideoUrl = currentLesson?.renderedVideoUrl || currentLesson?.videoUrl;
-    const hasHostedVideo = streamableVideoUrl && streamableVideoUrl.trim() !== '' && !hostedVideoFailed;
+    // Check if lesson has a streamable video URL — explicit URL, OR a server-rendered
+    // MP4 in lesson_videos (P2.2). When the rendered MP4 is available we prefer it
+    // over the live audio+image sync because audio/visual sync is baked in.
+    const courseDbId = (course as any)?._dbId || course?.id;
+    const lessonAny = currentLesson as any;
+    const hasRenderedInDb = !!(lessonAny?.hasRenderedVideoInDb || lessonAny?.hasRenderedVideo);
+    const renderedStreamUrl = (hasRenderedInDb && courseDbId && currentLesson?.id)
+        ? api.lessonVideo.streamUrl(courseDbId, currentLesson.id)
+        : null;
+    const streamableVideoUrl =
+        renderedStreamUrl ||
+        (currentLesson?.renderedVideoUrl && currentLesson.renderedVideoUrl.trim() !== '' ? currentLesson.renderedVideoUrl : '') ||
+        (currentLesson?.videoUrl && currentLesson.videoUrl.trim() !== '' ? currentLesson.videoUrl : '');
+    const hasHostedVideo = !!streamableVideoUrl && !hostedVideoFailed;
     
     // Check if there's audio/visuals content to fall back to
     const hasAudioData = !!(currentLesson?.audioData && currentLesson.audioData.trim() !== '');
@@ -276,6 +290,26 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
     }, []);
 
+    // Resolve any of the imageData shapes used across the codebase to a usable <img src=...>:
+    //   - already a URL (/media/, /objects/, /api/, http(s)://) → use as-is
+    //   - a data: URL → use as-is
+    //   - falsy → empty string
+    //   - otherwise treat as bare base64 PNG and wrap in a data URL (legacy fallback)
+    const resolveImageSrc = (imageData: string | undefined | null): string => {
+        if (!imageData) return '';
+        if (
+            imageData.startsWith('/media/') ||
+            imageData.startsWith('/objects/') ||
+            imageData.startsWith('/api/') ||
+            imageData.startsWith('http://') ||
+            imageData.startsWith('https://') ||
+            imageData.startsWith('data:')
+        ) {
+            return imageData;
+        }
+        return `data:image/png;base64,${imageData}`;
+    };
+
     const calculateTimings = (text: string, duration: number): WordTiming[] => {
         const words = text.trim().split(/\s+/);
         const wordWeights = words.map(w => w.length + 2.5);
@@ -326,7 +360,7 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         
         setIsGeneratingTakeaways(true);
         try {
-            const response = await fetch('/api/ai/generate-takeaways', {
+            const response = await apiFetch('/api/ai/generate-takeaways', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -351,7 +385,7 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
                     
                     // Persist to server so it's saved for future visits
                     const courseId = (course as any)._dbId || course.id;
-                    fetch(`/api/courses/${courseId}/lessons/${currentLesson.id}/takeaways`, {
+                    apiFetch(`/api/courses/${courseId}/lessons/${currentLesson.id}/takeaways`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -464,67 +498,55 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         const shouldTryFetch = !currentLesson.audioData && (hasAudioInDb || hasVisuals || sourceVideoId);
 
         if (shouldTryFetch && course.id && currentLesson.id) {
-            // Fetch audio from dedicated table
-            console.log(`Fetching audio from database for lesson ${currentLesson.id}`);
+            // P0.1 fast path: stream audio binary directly to <audio>, no atob, no JSON wrapping.
+            // Use timestamps as a probe to find which (courseId, lessonId) the audio is stored
+            // under — for composite lessons (built from a sourceVideoId) the audio lives under
+            // the source IDs, not the lesson's own ID.
+            console.log(`Streaming audio from database for lesson ${currentLesson.id}`);
             setIsAudioLoading(true);
-            api.lessonAudio.get(course.id, currentLesson.id)
-                .then((audio) => {
-                    if (audio && !isCancelled) {
-                        console.log(`Audio fetched from database for lesson ${currentLesson.id}`);
-                        processAudioData(audio.audioData, audio.mimeType);
-                        setIsAudioLoading(false);
-                        // Also use word timestamps from database if available
-                        if (audio.wordTimestamps && audio.wordTimestamps.length > 0) {
-                            setWordTimings(audio.wordTimestamps.map(wt => ({
-                                word: wt.word,
-                                start: wt.start,
-                                end: wt.end
-                            })));
-                        }
-                    } else if (!audio && sourceVideoId && sourceLessonId && !isCancelled) {
-                        // Fallback: try fetching from source video's audio
-                        console.log(`Audio not found, trying source video: ${sourceVideoId}/${sourceLessonId}`);
-                        api.lessonAudio.get(sourceVideoId, sourceLessonId)
-                            .then((sourceAudio) => {
-                                if (sourceAudio && !isCancelled) {
-                                    console.log(`Audio fetched from source video for lesson ${currentLesson.id}`);
-                                    processAudioData(sourceAudio.audioData, sourceAudio.mimeType);
-                                    if (sourceAudio.wordTimestamps && sourceAudio.wordTimestamps.length > 0) {
-                                        setWordTimings(sourceAudio.wordTimestamps.map(wt => ({
-                                            word: wt.word,
-                                            start: wt.start,
-                                            end: wt.end
-                                        })));
-                                    }
-                                }
-                                setIsAudioLoading(false);
-                            })
-                            .catch((err) => {
-                                console.error('Failed to fetch audio from source video:', err);
-                                setIsAudioLoading(false);
-                            });
-                    } else {
-                        setIsAudioLoading(false);
+
+            (async () => {
+                let resolvedCourseId = course.id;
+                let resolvedLessonId = currentLesson.id;
+                let meta = await api.lessonAudio.getTimestamps(course.id, currentLesson.id);
+                if (!meta && sourceVideoId && sourceLessonId) {
+                    console.log(`[Audio] No timestamps under own ID — trying source ${sourceVideoId}/${sourceLessonId}`);
+                    meta = await api.lessonAudio.getTimestamps(sourceVideoId, sourceLessonId);
+                    if (meta) {
+                        resolvedCourseId = sourceVideoId;
+                        resolvedLessonId = sourceLessonId;
                     }
-                })
-                .catch((err) => {
-                    console.error('Failed to fetch audio from database:', err);
-                    // Also try source video on error
-                    if (sourceVideoId && sourceLessonId && !isCancelled) {
-                        api.lessonAudio.get(sourceVideoId, sourceLessonId)
-                            .then((sourceAudio) => {
-                                if (sourceAudio && !isCancelled) {
-                                    console.log(`Audio fetched from source video (fallback) for lesson ${currentLesson.id}`);
-                                    processAudioData(sourceAudio.audioData, sourceAudio.mimeType);
-                                }
-                                setIsAudioLoading(false);
-                            })
-                            .catch(() => { setIsAudioLoading(false); });
-                    } else {
-                        setIsAudioLoading(false);
+                }
+
+                if (isCancelled) return;
+
+                if (meta) {
+                    const streamUrl = api.lessonAudio.streamUrl(resolvedCourseId, resolvedLessonId);
+                    console.log(`[Audio] Streaming from ${resolvedCourseId.slice(0,8)}../${resolvedLessonId.slice(0,30)}`);
+                    setAudioUrl(streamUrl);
+                    if (meta.wordTimestamps && meta.wordTimestamps.length > 0) {
+                        setWordTimings(meta.wordTimestamps.map(wt => ({
+                            word: wt.word, start: wt.start, end: wt.end
+                        })));
+                    } else if (currentLesson.durationSeconds && currentLesson.sourceText) {
+                        setWordTimings(calculateTimings(currentLesson.sourceText, currentLesson.durationSeconds));
                     }
-                });
-        } else if (currentLesson.audioData) {
+                } else {
+                    console.warn(`[Audio] No audio found for ${currentLesson.id} under own or source IDs`);
+                }
+                setIsAudioLoading(false);
+            })().catch(() => {
+                if (!isCancelled) setIsAudioLoading(false);
+            });
+
+            return () => {
+                isCancelled = true;
+                if (createdBlobUrl) URL.revokeObjectURL(createdBlobUrl);
+            };
+        }
+
+        // Inline audioData fallback (data URLs, /media URLs, etc.) — used when shouldTryFetch is false
+        if (currentLesson.audioData) {
             try {
                 // Check if it's a file URL or http URL
                 if (currentLesson.audioData.startsWith('/media/') || 
@@ -588,147 +610,90 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
         };
     }, [currentLesson, course.id]);
 
-    // Fetch image metadata (not actual images) when lesson loads - for lazy loading
+    // Fetch image metadata (not actual images) when lesson loads - for lazy loading.
+    // Falls back to sourceVideoId/sourceLessonId if the lesson's own metadata is empty
+    // (~30% of lessons store images under their source video's IDs, not their own).
     useEffect(() => {
         if (!rawLesson || !course.id || !rawLesson.id) return;
-        
+
         const existingVisuals = rawLesson.visuals || [];
-        const visualsMissingData = existingVisuals.length === 0 || 
+        const visualsMissingData = existingVisuals.length === 0 ||
             existingVisuals.some(v => !v.imageData || v.imageData.length < 100);
-        
+
         const courseDbId = (course as any)._dbId || course.id;
-        
-        // Fetch metadata only if we don't have it yet
-        if (visualsMissingData && !imageMetadata[rawLesson.id]) {
-            console.log(`[LAZY LOAD] Fetching image metadata for lesson ${rawLesson.id}`);
-            api.lessonImages.getMetadata(courseDbId, rawLesson.id)
-                .then((metadata) => {
-                    if (metadata && metadata.length > 0) {
-                        console.log(`[LAZY LOAD] Got metadata for ${metadata.length} images`);
-                        setImageMetadata(prev => ({
-                            ...prev,
-                            [rawLesson.id]: metadata
-                        }));
-                    }
-                })
-                .catch((err) => console.error('Failed to fetch image metadata:', err));
-        }
+        if (!visualsMissingData || imageMetadata[rawLesson.id]) return;
+
+        const sourceVideoId: string | undefined = (rawLesson as any).sourceVideoId;
+        const sourceLessonId: string | undefined = (rawLesson as any).sourceLessonId;
+
+        (async () => {
+            // Try the lesson's own ID first
+            console.log(`[Image Metadata] Trying ${courseDbId}/${rawLesson.id}`);
+            let metadata = await api.lessonImages.getMetadata(courseDbId, rawLesson.id);
+            let resolvedCourseId = courseDbId;
+            let resolvedLessonId = rawLesson.id;
+
+            // Fall back to source IDs if empty
+            if ((!metadata || metadata.length === 0) && sourceVideoId && sourceLessonId) {
+                console.log(`[Image Metadata] Empty under own ID — trying source ${sourceVideoId}/${sourceLessonId}`);
+                metadata = await api.lessonImages.getMetadata(sourceVideoId, sourceLessonId);
+                if (metadata && metadata.length > 0) {
+                    resolvedCourseId = sourceVideoId;
+                    resolvedLessonId = sourceLessonId;
+                }
+            }
+
+            if (metadata && metadata.length > 0) {
+                console.log(`[Image Metadata] Resolved ${metadata.length} images at ${resolvedCourseId}/${resolvedLessonId}`);
+                setImageMetadata(prev => ({ ...prev, [rawLesson.id]: metadata }));
+                setImageSource(prev => ({
+                    ...prev,
+                    [rawLesson.id]: { courseId: resolvedCourseId, lessonId: resolvedLessonId },
+                }));
+            } else {
+                console.warn(`[Image Metadata] No images found for ${rawLesson.id} under own or source IDs`);
+            }
+        })().catch(err => console.error('Image metadata error:', err));
     }, [rawLesson, course.id, imageMetadata]);
 
-    // Preload first 3 images immediately when metadata arrives
+    // P0.2: When metadata arrives for a lesson, build stream URLs for ALL images at once
+    // and prime the browser cache by kicking off parallel <img> loads. This replaces the
+    // old "preload 3, lazy-load 2 ahead" pattern that caused stalls during playback.
+    //
+    // Effect: every <img src=...> in the player points at a streaming URL the browser
+    // fetches with HTTP/2 multiplexing — no atob, no main-thread decode, no waterfalls.
     useEffect(() => {
-        if (!rawLesson || !rawLesson.id) return;
-        
-        const metadata = imageMetadata[rawLesson.id];
-        if (!metadata || metadata.length === 0) return;
-        
-        const courseDbId = (course as any)._dbId || course.id;
-        
-        // Sort metadata by visualIndex to get proper order
-        const sortedMeta = [...metadata].sort((a, b) => a.visualIndex - b.visualIndex);
-        
-        // Preload first 3 images (by sorted position, not by visualIndex)
-        const indicesToPreload = sortedMeta.slice(0, 3);
-        
-        for (let i = 0; i < indicesToPreload.length; i++) {
-            const meta = indicesToPreload[i];
-            // Use position as key, not visualIndex
-            const fetchKey = `${rawLesson.id}-pos-${i}`;
-            const alreadyLoaded = loadedImages[rawLesson.id]?.[i]; // Store by position
-            const alreadyFetching = fetchingImagesRef.current.has(fetchKey);
-            
-            if (!alreadyLoaded && !alreadyFetching) {
-                fetchingImagesRef.current.add(fetchKey);
-                console.log(`[PRELOAD] Fetching position ${i} (dbIndex ${meta.visualIndex})`);
-                
-                api.lessonImages.getOne(courseDbId, rawLesson.id, meta.visualIndex)
-                    .then((img) => {
-                        if (img && img.imageData) {
-                            console.log(`[PRELOAD] Got position ${i}`);
-                            setLoadedImages(prev => ({
-                                ...prev,
-                                [rawLesson.id]: {
-                                    ...(prev[rawLesson.id] || {}),
-                                    [i]: img.imageData // Store by position, not visualIndex
-                                }
-                            }));
-                        }
-                        fetchingImagesRef.current.delete(fetchKey);
-                    })
-                    .catch(() => fetchingImagesRef.current.delete(fetchKey));
-            }
-        }
-    }, [rawLesson, imageMetadata, course.id, loadedImages]);
+        if (!rawLesson || !rawLesson.id || !course.id) return;
 
-    // Lazy load individual images as needed based on currentTime
-    useEffect(() => {
-        if (!rawLesson || !rawLesson.id || !isPlaying) return;
-        
-        const existingVisuals = rawLesson.visuals || [];
         const metadata = imageMetadata[rawLesson.id];
         if (!metadata || metadata.length === 0) return;
-        
-        const courseDbId = (course as any)._dbId || course.id;
-        const duration = audioDuration || rawLesson.durationSeconds || 60;
-        
-        // Sort metadata by visualIndex to create position mapping
+
+        // Use the resolved (courseId, lessonId) where the metadata was actually found —
+        // may differ from current course/lesson when the lesson is built from sourceVideoId.
+        const src = imageSource[rawLesson.id] || {
+            courseId: ((course as any)._dbId || course.id),
+            lessonId: rawLesson.id,
+        };
         const sortedMeta = [...metadata].sort((a, b) => a.visualIndex - b.visualIndex);
-        
-        // Calculate which position should be showing based on time
-        let targetPosition = 0;
-        const hasStoredTiming = existingVisuals.some(v => v.startTime > 0 || v.endTime > 0);
-        
-        if (hasStoredTiming) {
-            for (let i = 0; i < existingVisuals.length; i++) {
-                if (currentTime >= existingVisuals[i].startTime && currentTime < existingVisuals[i].endTime) {
-                    targetPosition = i;
-                    break;
-                }
-                if (currentTime >= existingVisuals[i].startTime) {
-                    targetPosition = i;
-                }
-            }
-        } else {
-            const timePerImage = duration / Math.max(existingVisuals.length, sortedMeta.length);
-            targetPosition = Math.min(Math.floor(currentTime / timePerImage), sortedMeta.length - 1);
-        }
-        
-        // Also preload next 2 images by position
-        const positionsToLoad = [targetPosition, targetPosition + 1, targetPosition + 2].filter(i => i >= 0 && i < sortedMeta.length);
-        
-        for (const pos of positionsToLoad) {
-            const metaItem = sortedMeta[pos];
-            if (!metaItem) continue;
-            
-            const fetchKey = `${rawLesson.id}-pos-${pos}`;
-            const alreadyLoaded = loadedImages[rawLesson.id]?.[pos]; // Check by position
-            const alreadyFetching = fetchingImagesRef.current.has(fetchKey);
-            
-            if (!alreadyLoaded && !alreadyFetching) {
-                fetchingImagesRef.current.add(fetchKey);
-                console.log(`[LAZY LOAD] Fetching position ${pos} (dbIndex ${metaItem.visualIndex})`);
-                
-                api.lessonImages.getOne(courseDbId, rawLesson.id, metaItem.visualIndex)
-                    .then((img) => {
-                        if (img && img.imageData) {
-                            console.log(`[LAZY LOAD] Got position ${pos}, size: ${(img.imageData.length/1024).toFixed(0)}KB`);
-                            setLoadedImages(prev => ({
-                                ...prev,
-                                [rawLesson.id]: {
-                                    ...(prev[rawLesson.id] || {}),
-                                    [pos]: img.imageData // Store by position
-                                }
-                            }));
-                        }
-                        fetchingImagesRef.current.delete(fetchKey);
-                    })
-                    .catch((err) => {
-                        console.error(`Failed to fetch position ${pos}:`, err);
-                        fetchingImagesRef.current.delete(fetchKey);
-                    });
-            }
-        }
-    }, [rawLesson, currentTime, isPlaying, imageMetadata, audioDuration, loadedImages, course.id]);
+
+        const existing = loadedImages[rawLesson.id] || {};
+        if (Object.keys(existing).length >= sortedMeta.length) return;
+
+        const urlMap: Record<number, string> = {};
+        sortedMeta.forEach((meta, pos) => {
+            const url = api.lessonImages.streamUrl(src.courseId, src.lessonId, meta.visualIndex);
+            urlMap[pos] = url;
+            const img = new Image();
+            img.decoding = 'async';
+            img.src = url;
+        });
+
+        console.log(`[P0.2] Primed ${Object.keys(urlMap).length} image URLs for lesson ${rawLesson.id} via ${src.courseId.slice(0,8)}../${src.lessonId.slice(0,30)}`);
+        setLoadedImages(prev => ({
+            ...prev,
+            [rawLesson.id]: { ...(prev[rawLesson.id] || {}), ...urlMap }
+        }));
+    }, [rawLesson, imageMetadata, imageSource, course.id]);
 
     useEffect(() => {
         if (bgMusicRef.current) {
@@ -768,6 +733,38 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
     const handleTimeUpdate = (e: React.SyntheticEvent<HTMLAudioElement | HTMLVideoElement>) => {
         setCurrentTime(e.currentTarget.currentTime);
     };
+
+    // P1.2: 60fps sync loop. The <audio> element's `timeupdate` only fires ~4×/sec
+    // (~250 ms granularity), which means image swaps and caption highlights lag the
+    // audio by up to 250 ms. While playing, this RAF loop reads `audio.currentTime`
+    // every frame and pushes it into state, so visuals snap on time.
+    useEffect(() => {
+        if (!isPlaying) return;
+        let cancelled = false;
+        let lastPushed = -1;
+
+        const tick = () => {
+            if (cancelled) return;
+            const a = audioRef.current;
+            const v = hostedVideoRef.current;
+            const el = (v && !v.paused && v.currentTime > 0) ? v : a;
+            if (el) {
+                const t = el.currentTime;
+                // Only re-render if time actually advanced (avoid React spam during seek/pause).
+                if (Math.abs(t - lastPushed) > 0.05) {
+                    lastPushed = t;
+                    setCurrentTime(t);
+                }
+            }
+            requestAnimationFrame(tick);
+        };
+        const handle = requestAnimationFrame(tick);
+
+        return () => {
+            cancelled = true;
+            cancelAnimationFrame(handle);
+        };
+    }, [isPlaying]);
 
     const handleLessonChange = (mIdx: number, lIdx: number) => {
         setCurrentModuleIndex(mIdx);
@@ -822,39 +819,62 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
     };
 
     const handleDownloadVideo = async () => {
-        // Check for audio from lesson directly OR from database (audioUrl state)
-        const hasAudio = currentLesson?.audioData || audioUrl;
-        if (!currentLesson || !hasAudio) {
-            alert("Video content not available. Please regenerate the lesson if audio is missing.");
+        if (!currentLesson) {
+            alert("No lesson selected.");
             return;
         }
+        const courseDbId = (course as any)?._dbId || course?.id;
+        if (!courseDbId) {
+            alert("Course id missing — cannot download.");
+            return;
+        }
+
+        const safeName = (currentLesson.title || 'lesson').replace(/[^a-z0-9]/gi, '_');
+        const lessonAny = currentLesson as any;
+        const alreadyRendered = !!(lessonAny.hasRenderedVideoInDb || lessonAny.hasRenderedVideo);
+
+        // Helper: trigger a real <a download> click on the bucket URL.
+        const downloadFromServerStream = () => {
+            // The /video/stream endpoint 302s to the public bucket URL. Add the auth token
+            // as a query param so the browser can follow without our middleware bouncing.
+            const url = `/api/courses/${courseDbId}/lessons/${currentLesson.id}/video/stream?token=${encodeURIComponent(getToken() || '')}`;
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${safeName}.mp4`;
+            a.target = '_self';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        };
+
+        if (alreadyRendered) {
+            // Fast path — MP4 already in bucket. Browser pulls at CDN speed.
+            downloadFromServerStream();
+            return;
+        }
+
+        // No rendered MP4 yet → ask server to render now, then download.
         setIsDownloadingVideo(true);
         setDownloadProgress(0);
-        
-        // Slight delay to allow UI to update to "Saving..." state before heavy render starts
-        setTimeout(async () => {
-            try {
-                // If audio is from database, add it to the lesson object for rendering
-                const lessonToRender = audioUrl && !currentLesson.audioData 
-                    ? { ...currentLesson, audioData: audioUrl }
-                    : currentLesson;
-                    
-                const blob = await renderVideoFromLesson(lessonToRender, (progress) => {
-                    setDownloadProgress(progress);
-                });
-                if (blob) {
-                    downloadBlob(blob, `${currentLesson.title.replace(/[^a-z0-9]/gi, '_')}.webm`);
-                } else {
-                    alert("Render failed. Please check console for details.");
-                }
-            } catch (e) {
-                console.error(e);
-                alert("Failed to download.");
-            } finally {
-                setIsDownloadingVideo(false);
-                setDownloadProgress(0);
+        try {
+            const res = await apiFetch(`/api/courses/${courseDbId}/lessons/${currentLesson.id}/render-mp4`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || `HTTP ${res.status}`);
             }
-        }, 100);
+            // Render succeeded — bucket now has the MP4. Trigger the download.
+            downloadFromServerStream();
+        } catch (e: any) {
+            console.error('Download MP4 failed:', e);
+            alert(`Render failed: ${e?.message || 'unknown'}. Try again.`);
+        } finally {
+            setIsDownloadingVideo(false);
+            setDownloadProgress(0);
+        }
     };
 
     // --- Chat Logic ---
@@ -1272,8 +1292,8 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
                                         <div className="absolute inset-0 bg-black flex flex-col items-center justify-center text-center p-8">
                                             {/* Show first image as background */}
                                             {currentLesson.visuals && currentLesson.visuals[0] && (
-                                                <img 
-                                                    src={currentLesson.visuals[0].imageData.startsWith('/media/') || currentLesson.visuals[0].imageData.startsWith('/objects/') || currentLesson.visuals[0].imageData.startsWith('http') || currentLesson.visuals[0].imageData.startsWith('data:') ? currentLesson.visuals[0].imageData : `data:image/png;base64,${currentLesson.visuals[0].imageData}`}
+                                                <img
+                                                    src={resolveImageSrc(currentLesson.visuals[0].imageData)}
                                                     className="absolute inset-0 w-full h-full object-cover opacity-30"
                                                 />
                                             )}
@@ -1297,11 +1317,11 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
                                             <div className="absolute inset-0 bg-black flex items-center justify-center">
                                                 {!showBlankScreen && (
                                                     showThumbnail ? (
-                                                        <img src={currentLesson.thumbnailData?.startsWith('/media/') || currentLesson.thumbnailData?.startsWith('/objects/') || currentLesson.thumbnailData?.startsWith('http') || currentLesson.thumbnailData?.startsWith('data:') ? currentLesson.thumbnailData : `data:image/png;base64,${currentLesson.thumbnailData}`} className="w-full h-full object-contain opacity-90" />
+                                                        <img src={resolveImageSrc(currentLesson.thumbnailData)} className="w-full h-full object-contain opacity-90" />
                                                     ) : activeVisual ? (
-                                                        <img 
+                                                        <img
                                                             key={activeVisual.id}
-                                                            src={activeVisual.imageData.startsWith('/media/') || activeVisual.imageData.startsWith('/objects/') || activeVisual.imageData.startsWith('http') || activeVisual.imageData.startsWith('data:') ? activeVisual.imageData : `data:image/png;base64,${activeVisual.imageData}`}
+                                                            src={resolveImageSrc(activeVisual.imageData)}
                                                             className={`w-full h-full object-contain transition-transform duration-[20s] ease-linear ${activeVisual.zoomDirection === 'out' ? 'scale-[1.03]' : 'scale-100'} ${isPlaying ? (activeVisual.zoomDirection === 'out' ? 'scale-100' : 'scale-[1.03]') : ''}`}
                                                         />
                                                     ) : !hasAudioVisualContent ? (
@@ -1494,7 +1514,7 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
                                                         disabled={isDownloadingVideo}
                                                         className="text-xs font-bold bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors shadow-sm w-40 justify-center"
                                                     >
-                                                        {isDownloadingVideo ? <Loader2 size={14} className="animate-spin"/> : <Download size={14}/>} {isDownloadingVideo ? `Saving ${Math.round(downloadProgress)}%` : 'Download Video'}
+                                                        {isDownloadingVideo ? <Loader2 size={14} className="animate-spin"/> : <Download size={14}/>} {isDownloadingVideo ? 'Rendering MP4…' : 'Download MP4'}
                                                     </button>
                                                 </div>
                                                 <div className="prose prose-slate prose-lg max-w-none">
