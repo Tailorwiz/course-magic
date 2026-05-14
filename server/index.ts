@@ -2968,6 +2968,50 @@ const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
 });
 
+// Fallback image generator via OpenAI. Tries gpt-image-1 first (newer, photoreal,
+// closer to Gemini's look), falls back to DALL-E 3 if the org isn't verified for
+// gpt-image-1. Returns base64 (no data: prefix) so callers can stay compatible
+// with the existing Gemini response shape.
+async function generateImageOpenAI(prompt: string, aspectRatio: string = '16:9'): Promise<{ b64: string; model: string }> {
+  // gpt-image-1 supports: 1024x1024, 1024x1536, 1536x1024
+  let gptSize: '1024x1024' | '1024x1536' | '1536x1024' = '1024x1024';
+  if (aspectRatio === '16:9' || aspectRatio === '4:3') gptSize = '1536x1024';
+  else if (aspectRatio === '9:16' || aspectRatio === '3:4' || aspectRatio === '2:3') gptSize = '1024x1536';
+
+  // dall-e-3 supports: 1024x1024, 1024x1792, 1792x1024
+  let dalleSize: '1024x1024' | '1024x1792' | '1792x1024' = '1024x1024';
+  if (aspectRatio === '16:9' || aspectRatio === '4:3') dalleSize = '1792x1024';
+  else if (aspectRatio === '9:16' || aspectRatio === '3:4' || aspectRatio === '2:3') dalleSize = '1024x1792';
+
+  // Attempt 1: gpt-image-1 (Gemini-like quality)
+  try {
+    const resp = await (openai.images as any).generate({
+      model: 'gpt-image-1',
+      prompt,
+      n: 1,
+      size: gptSize,
+    });
+    const b64 = resp?.data?.[0]?.b64_json;
+    if (b64) return { b64, model: 'gpt-image-1' };
+    throw new Error('gpt-image-1 returned no b64_json');
+  } catch (err: any) {
+    console.warn('gpt-image-1 failed, trying dall-e-3:', String(err?.message || err).slice(0, 200));
+  }
+
+  // Attempt 2: dall-e-3
+  const resp = await (openai.images as any).generate({
+    model: 'dall-e-3',
+    prompt,
+    n: 1,
+    size: dalleSize,
+    response_format: 'b64_json',
+    quality: 'standard',
+  });
+  const b64 = resp?.data?.[0]?.b64_json;
+  if (!b64) throw new Error('dall-e-3 returned no b64_json');
+  return { b64, model: 'dall-e-3' };
+}
+
 app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
   const { prompt, aspectRatio = "16:9" } = req.body;
 
@@ -3016,19 +3060,38 @@ app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
     console.warn(`Gemini 3 Pro failed${isRate ? ' (rate-limited)' : ''}, trying Gemini 2.5 Flash Image:`, msg.slice(0, 200));
   }
 
+  let secondError: any = null;
   try {
     const data = await tryModel('gemini-2.5-flash-image', 'Gemini 2.5 Flash Image');
     console.log('Gemini 2.5 Flash Image generated successfully (fallback)');
     return res.json({ imageData: data, provider: 'gemini-2.5-flash', success: true, fellBackFrom: 'gemini-3-pro' });
   } catch (err: any) {
-    console.error('Both Gemini models failed.');
-    return res.status(500).json({
-      error: 'Image generation failed — both Gemini models exhausted.',
-      gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
-      gemini25FlashError: String(err?.message || err).slice(0, 300),
-      hint: 'Check Gemini API billing at https://console.cloud.google.com/billing for the project tied to your API key.',
-    });
+    secondError = err;
+    console.warn('Gemini 2.5 Flash also failed, trying OpenAI image gen:', String(err?.message || err).slice(0, 200));
   }
+
+  // Both Gemini models failed → OpenAI image gen as last resort.
+  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      const { b64, model } = await generateImageOpenAI(prompt, aspectRatio);
+      console.log(`OpenAI image generated successfully via ${model} (fallback from Gemini)`);
+      return res.json({ imageData: b64, provider: `openai-${model}`, success: true, fellBackFrom: 'gemini' });
+    } catch (err: any) {
+      console.error('OpenAI image gen also failed:', String(err?.message || err).slice(0, 300));
+      return res.status(500).json({
+        error: 'Image generation failed across all providers.',
+        gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
+        gemini25FlashError: String(secondError?.message || secondError).slice(0, 300),
+        openaiError: String(err?.message || err).slice(0, 300),
+      });
+    }
+  }
+
+  return res.status(500).json({
+    error: 'Image generation failed — both Gemini models exhausted, no OpenAI key configured.',
+    gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
+    gemini25FlashError: String(secondError?.message || secondError).slice(0, 300),
+  });
 });
 
 
@@ -3081,79 +3144,132 @@ app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
     if (response.candidates?.[0]?.content?.parts) {
       for (const part of response.candidates[0].content.parts) {
         if (part.inlineData && part.inlineData.data) {
-          console.log('AI cover generated successfully');
-          return res.json({ 
+          console.log('AI cover generated successfully via Gemini');
+          return res.json({
             imageData: `data:image/png;base64,${part.inlineData.data}`,
-            success: true 
+            provider: 'gemini',
+            success: true
           });
         }
       }
     }
     throw new Error('No image data in Gemini response');
-  } catch (error: any) {
-    console.error('Cover generation failed:', error?.message);
-    return res.status(500).json({ 
-      error: 'Cover generation failed', 
-      details: error?.message 
-    });
+  } catch (geminiError: any) {
+    console.warn('Gemini cover gen failed, trying OpenAI fallback:', String(geminiError?.message || geminiError).slice(0, 200));
+
+    if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
+      return res.status(500).json({ error: 'Cover generation failed', details: geminiError?.message });
+    }
+
+    try {
+      // 2:3 portrait for book covers; OpenAI image gen handles that aspect.
+      const coverPrompt = isEditing
+        ? `Book cover design. Title: "${title}". Subtitle/headline: "${headline || ''}". STYLE: High-end corporate, premium, photoreal. ${instructions || ''}`
+        : `Design a high-end corporate book cover. Title: "${title}". Subtitle/headline: "${headline || ''}". Premium, photoreal, polished. ${instructions || ''}`;
+      const { b64, model } = await generateImageOpenAI(coverPrompt, '2:3');
+      console.log(`AI cover generated successfully via OpenAI ${model} (fallback from Gemini)`);
+      return res.json({
+        imageData: `data:image/png;base64,${b64}`,
+        provider: `openai-${model}`,
+        success: true,
+        fellBackFrom: 'gemini',
+      });
+    } catch (openaiError: any) {
+      console.error('OpenAI cover gen also failed:', String(openaiError?.message || openaiError).slice(0, 300));
+      return res.status(500).json({
+        error: 'Cover generation failed across all providers',
+        geminiError: String(geminiError?.message || geminiError).slice(0, 300),
+        openaiError: String(openaiError?.message || openaiError).slice(0, 300),
+      });
+    }
   }
 });
 
 // AI Metadata Generation endpoint - generates headlines/descriptions from files
 app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) => {
   const { target, fileData, fileMimeType, coverData } = req.body;
-  
+
   if (!target || (target !== 'headline' && target !== 'description')) {
     return res.status(400).json({ error: "Target must be 'headline' or 'description'" });
   }
-  
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!geminiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is required.' });
+
+  const promptInstr = target === 'headline'
+    ? 'Generate course headline (max 15 words). Return JSON: { "text": "..." }'
+    : 'Generate course description (50 words). Return JSON: { "text": "..." }';
+
+  // Try Gemini (which supports inline file + image in one call)
+  let geminiError: any = null;
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      console.log(`Generating ${target} with Gemini...`);
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const parts: any[] = [];
+      if (fileData && fileMimeType) parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
+      if (coverData) {
+        const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
+        parts.push({ inlineData: { data: base64, mimeType: 'image/png' } });
+      }
+      if (parts.length === 0) {
+        return res.status(400).json({ error: "No file or cover data provided" });
+      }
+      parts.push({ text: promptInstr });
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: { parts },
+        config: { responseMimeType: "application/json" }
+      });
+
+      const json = JSON.parse(response.text || "{}");
+      console.log(`${target} generated successfully via Gemini`);
+      return res.json({ text: json.text, provider: 'gemini', success: true });
+    } catch (err: any) {
+      geminiError = err;
+      console.warn(`Gemini ${target} gen failed, trying OpenAI:`, String(err?.message || err).slice(0, 200));
+    }
   }
-  
-  try {
-    console.log(`Generating ${target} with Gemini...`);
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-    
-    const parts: any[] = [];
-    
-    // Add file if provided
-    if (fileData && fileMimeType) {
-      parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
+
+  // OpenAI fallback. Note: GPT-4o-mini can read images via the chat completions API
+  // but we already have the cover image as base64 — pass it as an image_url data: URL.
+  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      const content: any[] = [{ type: 'text', text: promptInstr }];
+      // Include the cover image if provided (gives the model visual context for the title).
+      if (coverData) {
+        const dataUrl = coverData.startsWith('data:') ? coverData : `data:image/png;base64,${coverData}`;
+        content.push({ type: 'image_url', image_url: { url: dataUrl } });
+      }
+      // OpenAI doesn't accept arbitrary PDF/binary in chat.completions for vision; if
+      // fileData is a PDF or image we degrade by pasting a text hint asking for a
+      // generic course headline/description.
+      if (fileData && fileMimeType && fileMimeType.startsWith('image/')) {
+        content.push({ type: 'image_url', image_url: { url: `data:${fileMimeType};base64,${fileData}` } });
+      } else if (fileData) {
+        content.unshift({ type: 'text', text: 'A course file was provided but OpenAI cannot read non-image binary data directly. Generate based on the cover image and instructions only.' });
+      }
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content }],
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 256,
+      });
+
+      const text = response.choices[0]?.message?.content || '{}';
+      const parsed = JSON.parse(text);
+      console.log(`${target} generated successfully via OpenAI (fallback)`);
+      return res.json({ text: parsed.text, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+    } catch (err: any) {
+      console.error(`OpenAI ${target} gen failed:`, String(err?.message || err).slice(0, 300));
+      return res.status(500).json({
+        error: 'Metadata generation failed across all providers',
+        geminiError: geminiError ? String(geminiError?.message || geminiError).slice(0, 300) : undefined,
+        openaiError: String(err?.message || err).slice(0, 300),
+      });
     }
-    
-    // Add cover if provided
-    if (coverData) {
-      const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
-      parts.push({ inlineData: { data: base64, mimeType: 'image/png' } });
-    }
-    
-    if (parts.length === 0) {
-      return res.status(400).json({ error: "No file or cover data provided" });
-    }
-    
-    const prompt = target === 'headline' 
-      ? "Generate course headline (max 15 words). Return JSON: { \"text\": \"...\" }" 
-      : "Generate course description (50 words). Return JSON: { \"text\": \"...\" }";
-    parts.push({ text: prompt });
-    
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: { parts },
-      config: { responseMimeType: "application/json" }
-    });
-    
-    const json = JSON.parse(response.text || "{}");
-    console.log(`${target} generated successfully`);
-    return res.json({ text: json.text, success: true });
-  } catch (error: any) {
-    console.error(`Metadata generation failed:`, error?.message);
-    return res.status(500).json({ 
-      error: 'Metadata generation failed', 
-      details: error?.message 
-    });
   }
+
+  return res.status(500).json({ error: 'Metadata generation failed', details: String(geminiError?.message || geminiError) });
 });
 
 // Simple FLUX test endpoint - generates just 1 test image
