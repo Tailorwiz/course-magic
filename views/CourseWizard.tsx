@@ -446,9 +446,32 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
 
   const fileToGenerativePart = async (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onloadend = () => { const base64String = reader.result as string; const base64Data = base64String.split(',')[1]; resolve({ inlineData: { data: base64Data, mimeType: file.type } }); }; reader.onerror = reject; reader.readAsDataURL(file); }); };
 
-  const generateMetadata = async (target: 'headline' | 'description') => {
+  // Convert an arbitrary URL or data: string to a base64 data URL. Returns the
+  // original string if already a data URL, or undefined on failure.
+  const coverToDataUrl = async (src: string | undefined): Promise<string | undefined> => {
+      if (!src) return undefined;
+      if (src.startsWith('data:') && src.includes('base64')) return src;
+      try {
+          const resp = await apiFetch(src);
+          if (!resp.ok) return undefined;
+          const blob = await resp.blob();
+          return await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result as string);
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+          });
+      } catch {
+          return undefined;
+      }
+  };
+
+  // Single API call that fetches BOTH headline and description in one round-trip
+  // by calling the endpoint twice in parallel after preparing the shared payload.
+  const generateMetadata = async (target: 'headline' | 'description' | 'both') => {
       if (!file && !ecoverFile && !ecoverPreview) { alert("Upload file or cover first."); return; }
-      setIsAutoGeneratingDetails(target);
+      // Track 'both' as 'headline' for the spinner — UI just needs a non-null value.
+      setIsAutoGeneratingDetails(target === 'both' ? 'headline' : target);
       try {
           // Convert file to base64 if present
           let fileData: string | undefined;
@@ -462,17 +485,37 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
             fileData = filePart.inlineData.data;
             fileMimeType = filePart.inlineData.mimeType;
           }
-          // Get cover data if available
-          const coverData = ecoverPreview && ecoverPreview.startsWith('data:') && ecoverPreview.includes('base64') ? ecoverPreview : undefined;
-          
-          const response = await apiFetch('/api/ai/generate-metadata', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ target, fileData, fileMimeType, coverData })
+          // Get cover data if available. Accept BOTH data: URLs and remote URLs (we fetch them).
+          const coverData = await coverToDataUrl(ecoverPreview);
+
+          // If we have no usable input at all, bail with a clearer message.
+          if (!fileData && !coverData) {
+              alert("Could not read your cover image. Re-upload the cover, or upload a source file (PDF/TXT/MD).");
+              return;
+          }
+
+          const targets: Array<'headline' | 'description'> = target === 'both' ? ['headline', 'description'] : [target];
+          const body = { fileData, fileMimeType, coverData };
+
+          const results = await Promise.all(targets.map(async (t) => {
+              const response = await apiFetch('/api/ai/generate-metadata', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: t, ...body })
+              });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error || `Failed to generate ${t}`);
+              return { target: t, text: data.text };
+          }));
+
+          // Apply all updates in a single state mutation so React renders once.
+          setCourseDetails(prev => {
+              const next = { ...prev };
+              for (const r of results) {
+                  if (r.text) next[r.target] = r.text;
+              }
+              return next;
           });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || 'Generation failed');
-          if (data.text) { setCourseDetails(prev => ({ ...prev, [target]: data.text })); }
       } catch (e: any) { alert(e.message || `Failed to generate ${target}.`); } finally { setIsAutoGeneratingDetails(null); }
   };
 
@@ -1379,7 +1422,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                                     </div>
                                 </div>
                                 <div className="absolute bottom-4 right-4 z-20">
-                                    <Button size="sm" variant={file || courseDetails.title ? "primary" : "secondary"} className="shadow-md" onClick={(e) => { e.stopPropagation(); generateMetadata('headline'); generateMetadata('description'); }} disabled={isAutoGeneratingDetails !== null} icon={isAutoGeneratingDetails ? <Loader2 size={14} className="animate-spin"/> : <Sparkles size={14}/>}>
+                                    <Button size="sm" variant={file || courseDetails.title ? "primary" : "secondary"} className="shadow-md" onClick={(e) => { e.stopPropagation(); generateMetadata('both'); }} disabled={isAutoGeneratingDetails !== null} icon={isAutoGeneratingDetails ? <Loader2 size={14} className="animate-spin"/> : <Sparkles size={14}/>}>
                                         {isAutoGeneratingDetails ? 'Analyzing...' : 'Auto-Fill Details'}
                                     </Button>
                                 </div>
