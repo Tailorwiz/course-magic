@@ -914,65 +914,69 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
           return;
       }
       setIsGeneratingMeta(target);
-      const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
       try {
-          const parts: any[] = [];
-          let prompt = "";
-          
-          // If we have an uploaded file (ebook/PDF), extract the ACTUAL title from it
-          if (fileToUse) { 
-              parts.push(await fileToGenerativePart(fileToUse));
-              if (target === 'all') {
-                  prompt = `Look at this document and EXTRACT the EXACT title and subtitle as written. Do NOT make up new titles. Return JSON: { "title": "the exact book/document title", "headline": "the exact subtitle if present, otherwise empty string", "description": "a brief factual summary of what this document is about" }. Return the ACTUAL text from the document, not creative rewrites.`;
-              } else if (target === 'title') {
-                  prompt = `Look at this document and EXTRACT the EXACT title as written on the title page or cover. Do NOT make up a new title. Return JSON: { "text": "the exact title" }`;
-              } else if (target === 'headline') {
-                  prompt = `Look at this document and EXTRACT the EXACT subtitle as written. If no subtitle exists, return the author name or a key phrase from the cover. Do NOT make up text. Return JSON: { "text": "the exact subtitle or author" }`;
-              } else {
-                  prompt = `Read this document and write a brief factual description of what it covers. Be direct and specific. Return JSON: { "text": "description" }`;
-              }
-          } 
-          // If we have an ecover image, read the text from it
-          else if (ecoverPreview) {
-              const base64Data = ecoverPreview.split(',')[1];
-              parts.push({ inlineData: { data: base64Data, mimeType: 'image/png' } });
-              if (target === 'all') {
-                  prompt = `Look at this book cover/ecover image and READ the EXACT text written on it. EXTRACT the title and subtitle exactly as shown. Return JSON: { "title": "the exact title text from the image", "headline": "the exact subtitle text from the image", "description": "a brief description based on what the cover shows" }. Return the ACTUAL text visible on the cover, not creative rewrites.`;
-              } else if (target === 'title') {
-                  prompt = `Look at this cover image and READ the EXACT title text as shown. Return JSON: { "text": "the exact title from the image" }`;
-              } else if (target === 'headline') {
-                  prompt = `Look at this cover image and READ the EXACT subtitle text as shown. Return JSON: { "text": "the exact subtitle from the image" }`;
-              } else {
-                  prompt = `Based on this cover image, write a brief factual description. Return JSON: { "text": "description" }`;
-              }
+          // Prepare payload for the server endpoint (which has Gemini->OpenAI fallback).
+          let fileData: string | undefined;
+          let fileMimeType: string | undefined;
+          if (fileToUse) {
+              const part = await fileToGenerativePart(fileToUse);
+              fileData = part.inlineData.data;
+              fileMimeType = part.inlineData.mimeType;
           }
-          // Fallback: no file, just use what user typed
-          else {
+          // Cover image — server accepts data: URLs OR remote URLs (it'll fetch them
+          // server-side via the openai vision payload). We only pass data: URLs to keep
+          // payload self-contained.
+          const coverData = ecoverPreview && ecoverPreview.startsWith('data:') && ecoverPreview.includes('base64')
+              ? ecoverPreview
+              : undefined;
+
+          // If we have neither file nor cover and a text context, fall back to
+          // generate-mode using the typed context. Server defaults: file -> extract,
+          // no file -> generate.
+          if (!fileData && !coverData) {
               const context = details.title || details.description;
               if (target === 'description' && context) {
-                  prompt = `Write a brief, direct description for a video about: "${context}". Return JSON: { "text": "description" }`;
-              } else {
+                  // Old code generated a description from the typed title. Keep parity
+                  // by issuing a generate-mode request with no media; server prompt
+                  // doesn't know the typed context though, so embed it.
+                  const response = await apiFetch('/api/ai/generate-metadata', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ target: 'description', mode: 'generate', context })
+                  });
+                  const data = await response.json();
+                  if (response.ok && data.text) setDetails(prev => ({ ...prev, description: data.text }));
                   return;
               }
+              return;
           }
-          
-          parts.push({ text: prompt });
-          const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: selectedAIModel, contents: { parts }, config: { responseMimeType: "application/json" } }));
-          const json = JSON.parse(response.text || "{}");
+
+          const response = await apiFetch('/api/ai/generate-metadata', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ target, fileData, fileMimeType, coverData })
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Generation failed');
+
           if (target === 'all') {
-              if (json.title) setDetails(prev => ({ ...prev, title: json.title }));
-              if (json.headline) setDetails(prev => ({ ...prev, headline: json.headline }));
-              if (json.description) setDetails(prev => ({ ...prev, description: json.description }));
-          } else if (target === 'title' && json.text) {
-              setDetails(prev => ({ ...prev, title: json.text }));
-          } else if (target === 'headline' && json.text) {
-              setDetails(prev => ({ ...prev, headline: json.text }));
-          } else if (target === 'description' && json.text) {
-              setDetails(prev => ({ ...prev, description: json.text }));
+              setDetails(prev => ({
+                  ...prev,
+                  title: data.title || prev.title,
+                  headline: data.headline || prev.headline,
+                  description: data.description || prev.description,
+              }));
+          } else if (data.text) {
+              setDetails(prev => ({ ...prev, [target]: data.text }));
           }
-      } catch (e) {
-          console.error(e);
-          if(!overrideFile && initialType !== 'Slide Deck') alert("Failed to extract details. Try a different file.");
+      } catch (e: any) {
+          console.error('generateMetadata failed:', e);
+          // Suppress the alert on file-upload auto-trigger (overrideFile present) so
+          // the user doesn't get a popup right after picking a PDF — the title was
+          // already set to the filename, they can edit by hand or click AI Generate.
+          if (!overrideFile && initialType !== 'Slide Deck') {
+              alert(e?.message || "Failed to extract details. Try a different file.");
+          }
       } finally {
           setIsGeneratingMeta(null);
       }

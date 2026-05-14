@@ -3202,22 +3202,77 @@ app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
 });
 
 // AI Metadata Generation endpoint - generates headlines/descriptions from files
-app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) => {
-  const { target, fileData, fileMimeType, coverData } = req.body;
+// Extract plain text from a PDF buffer using pdf-parse v2's PDFParse class.
+// Used so OpenAI (which cannot directly read PDF binaries in chat.completions)
+// still has something to work with when Gemini is down.
+async function extractPdfText(buffer: Buffer, maxChars = 8000): Promise<string> {
+  try {
+    const mod: any = await import('pdf-parse');
+    const PDFParse = mod.PDFParse || mod.default?.PDFParse;
+    if (!PDFParse) {
+      // Fallback: maybe an older default-function export shape.
+      const fn = mod.default || mod;
+      if (typeof fn === 'function') {
+        const result = await fn(buffer);
+        return (result?.text || '').slice(0, maxChars).trim();
+      }
+      console.warn('pdf-parse: no PDFParse class or callable default export');
+      return '';
+    }
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    return (result?.text || '').slice(0, maxChars).trim();
+  } catch (e: any) {
+    console.warn('pdf-parse failed:', String(e?.message || e).slice(0, 200));
+    return '';
+  }
+}
 
-  if (!target || (target !== 'headline' && target !== 'description')) {
-    return res.status(400).json({ error: "Target must be 'headline' or 'description'" });
+app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) => {
+  const { target, fileData, fileMimeType, coverData, mode: rawMode, context } = req.body;
+
+  const validTargets = ['title', 'headline', 'description', 'all'];
+  if (!target || !validTargets.includes(target)) {
+    return res.status(400).json({ error: `Target must be one of: ${validTargets.join(', ')}` });
   }
 
-  const promptInstr = target === 'headline'
-    ? 'Generate course headline (max 15 words). Return JSON: { "text": "..." }'
-    : 'Generate course description (50 words). Return JSON: { "text": "..." }';
+  // Default: when a source file is given, EXTRACT exact text (book title, etc.);
+  // otherwise GENERATE creatively. Clients can override by passing `mode`.
+  const mode: 'extract' | 'generate' = rawMode === 'extract' || rawMode === 'generate'
+    ? rawMode
+    : (fileData ? 'extract' : 'generate');
+
+  const buildPrompt = (): string => {
+    if (mode === 'extract') {
+      if (target === 'all') return 'Look at this document/cover and EXTRACT the EXACT text as written. Do NOT make up new text. Return JSON: { "title": "exact title", "headline": "exact subtitle or empty string", "description": "brief factual summary of what this is about" }';
+      if (target === 'title') return 'Look at this document/cover and EXTRACT the EXACT title as written. Do NOT make up a new title. Return JSON: { "text": "the exact title" }';
+      if (target === 'headline') return 'Look at this document/cover and EXTRACT the EXACT subtitle as written. If no subtitle exists, return the author name or a key phrase. Do NOT make up text. Return JSON: { "text": "the exact subtitle" }';
+      return 'Read this document/cover and write a brief factual description of what it covers. Be direct and specific. Return JSON: { "text": "description" }';
+    }
+    // generate mode — append client-supplied context (e.g. typed title) so the
+    // model has something to anchor on when no file/cover was provided.
+    const ctx = typeof context === 'string' && context.trim() ? `\nContext: ${context.trim().slice(0, 500)}` : '';
+    if (target === 'all') return `Generate course metadata. Return JSON: { "title": "engaging title under 60 chars", "headline": "headline under 15 words", "description": "description around 50 words" }${ctx}`;
+    if (target === 'title') return `Generate an engaging course title (under 60 chars). Return JSON: { "text": "..." }${ctx}`;
+    if (target === 'headline') return `Generate course headline (max 15 words). Return JSON: { "text": "..." }${ctx}`;
+    return `Generate course description (50 words). Return JSON: { "text": "..." }${ctx}`;
+  };
+
+  const promptInstr = buildPrompt();
+
+  // Normalize the parsed model output to the response shape clients expect.
+  const shapeResponse = (parsed: any) => {
+    if (target === 'all') {
+      return { title: parsed.title ?? '', headline: parsed.headline ?? '', description: parsed.description ?? '' };
+    }
+    return { text: parsed.text ?? '' };
+  };
 
   // Try Gemini (which supports inline file + image in one call)
   let geminiError: any = null;
   if (process.env.GEMINI_API_KEY) {
     try {
-      console.log(`Generating ${target} with Gemini...`);
+      console.log(`Generating ${target} (${mode}) with Gemini...`);
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const parts: any[] = [];
       if (fileData && fileMimeType) parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
@@ -3225,7 +3280,7 @@ app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) =
         const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
         parts.push({ inlineData: { data: base64, mimeType: 'image/png' } });
       }
-      if (parts.length === 0) {
+      if (parts.length === 0 && mode === 'extract') {
         return res.status(400).json({ error: "No file or cover data provided" });
       }
       parts.push({ text: promptInstr });
@@ -3238,43 +3293,62 @@ app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) =
 
       const json = JSON.parse(response.text || "{}");
       console.log(`${target} generated successfully via Gemini`);
-      return res.json({ text: json.text, provider: 'gemini', success: true });
+      return res.json({ ...shapeResponse(json), provider: 'gemini', success: true });
     } catch (err: any) {
       geminiError = err;
       console.warn(`Gemini ${target} gen failed, trying OpenAI:`, String(err?.message || err).slice(0, 200));
     }
   }
 
-  // OpenAI fallback. Note: GPT-4o-mini can read images via the chat completions API
-  // but we already have the cover image as base64 — pass it as an image_url data: URL.
+  // OpenAI fallback. Chat-completions vision accepts images directly; for PDFs
+  // we run pdf-parse server-side and pass the extracted text as plain context.
   if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
     try {
       const content: any[] = [{ type: 'text', text: promptInstr }];
-      // Include the cover image if provided (gives the model visual context for the title).
+
+      // Cover image — vision-capable models read it directly.
       if (coverData) {
         const dataUrl = coverData.startsWith('data:') ? coverData : `data:image/png;base64,${coverData}`;
         content.push({ type: 'image_url', image_url: { url: dataUrl } });
       }
-      // OpenAI doesn't accept arbitrary PDF/binary in chat.completions for vision; if
-      // fileData is a PDF or image we degrade by pasting a text hint asking for a
-      // generic course headline/description.
-      if (fileData && fileMimeType && fileMimeType.startsWith('image/')) {
-        content.push({ type: 'image_url', image_url: { url: `data:${fileMimeType};base64,${fileData}` } });
-      } else if (fileData) {
-        content.unshift({ type: 'text', text: 'A course file was provided but OpenAI cannot read non-image binary data directly. Generate based on the cover image and instructions only.' });
+
+      // Source file: images go in as image_url; PDFs get text-extracted first;
+      // text-like files get pasted directly.
+      if (fileData && fileMimeType) {
+        if (fileMimeType.startsWith('image/')) {
+          content.push({ type: 'image_url', image_url: { url: `data:${fileMimeType};base64,${fileData}` } });
+        } else if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
+          const buf = Buffer.from(fileData, 'base64');
+          const text = await extractPdfText(buf);
+          if (text) {
+            content.push({ type: 'text', text: `Source PDF text (first 8000 chars):\n\n${text}` });
+          } else {
+            content.unshift({ type: 'text', text: 'The user uploaded a PDF but text could not be extracted. Use the cover image (if any) and filename as context.' });
+          }
+        } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
+          // For TXT/MD: decode base64 to UTF-8 string.
+          try {
+            const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 8000);
+            content.push({ type: 'text', text: `Source file content:\n\n${decoded}` });
+          } catch {
+            // ignore
+          }
+        } else {
+          content.unshift({ type: 'text', text: `A file of type ${fileMimeType} was provided but cannot be read directly. Use any cover image and filename as context.` });
+        }
       }
 
       const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [{ role: 'user', content }],
         response_format: { type: 'json_object' },
-        max_completion_tokens: 256,
+        max_completion_tokens: target === 'all' ? 512 : 256,
       });
 
       const text = response.choices[0]?.message?.content || '{}';
       const parsed = JSON.parse(text);
       console.log(`${target} generated successfully via OpenAI (fallback)`);
-      return res.json({ text: parsed.text, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+      return res.json({ ...shapeResponse(parsed), provider: 'openai', success: true, fellBackFrom: 'gemini' });
     } catch (err: any) {
       console.error(`OpenAI ${target} gen failed:`, String(err?.message || err).slice(0, 300));
       return res.status(500).json({
