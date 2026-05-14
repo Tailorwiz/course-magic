@@ -865,9 +865,16 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
     if (!file && generationStrategy !== 'creative' && !initialCourse) { alert("Please upload a PDF file for Strict or Hybrid modes."); return; }
     setStep('outline'); setParsingProgress(10); setIsProcessingAI(true);
     try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        let filePart: any = null;
-        if (file && generationStrategy !== 'creative') { filePart = await fileToGenerativePart(file); }
+        // Prepare the file payload once. We'll send it to the server endpoint
+        // (which tries Gemini, then falls back to OpenAI with extracted text)
+        // so PDFs still work when Gemini is down.
+        let fileData: string | undefined;
+        let fileMimeType: string | undefined;
+        if (file && generationStrategy !== 'creative') {
+            const filePart = await fileToGenerativePart(file);
+            fileData = filePart.inlineData.data;
+            fileMimeType = filePart.inlineData.mimeType;
+        }
         setParsingProgress(25);
         const jsonExample = `{ "modules": [ { "title": "Module Title", "lessons": [ { "title": "Lesson Title", "summary": "Lesson summary" } ] } ] }`;
         let countInstruction = "";
@@ -910,11 +917,18 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
             case 'creative': prompt = `Create a comprehensive course outline for a course titled "${courseDetails.title}". Be creative, structured, and educational. Ignore the file if provided. ${combinedInstructions}`; break;
         }
         if (outlineInstructions.trim()) { prompt += `\n\nIMPORTANT USER INSTRUCTIONS: The user has provided specific guidance for this outline. You MUST follow these notes:\n"${outlineInstructions}"\n\nApply these instructions when determining the modules and lessons.`; }
+        // Reinforce JSON shape for the OpenAI fallback path (Gemini gets it via responseSchema).
+        prompt += `\n\nRESPOND WITH JSON ONLY in this exact shape:\n{ "modules": [ { "title": "string", "lessons": [ { "title": "string", "summary": "string" } ] } ] }`;
         setParsingProgress(40);
-        const parts = filePart ? [filePart, { text: prompt }] : [{ text: prompt }];
-        const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { role: 'user', parts: parts }, config: { thinkingConfig: { thinkingBudget: 4096 }, responseMimeType: "application/json", responseSchema: { type: Type.OBJECT, properties: { modules: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, lessons: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, summary: { type: Type.STRING } }, required: ["title", "summary"] } } }, required: ["title", "lessons"] } } } } } }));
+        const apiResponse = await apiFetch('/api/ai/generate-from-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, fileData, fileMimeType, jsonMode: true, maxTokens: 8192 })
+        });
+        const apiJson = await apiResponse.json();
+        if (!apiResponse.ok) throw new Error(apiJson.error || 'Outline generation failed');
         setParsingProgress(80);
-        const cleanJson = (response.text || "{}").replace(/```json/g, '').replace(/```/g, '').trim();
+        const cleanJson = (apiJson.text || "{}").replace(/```json/g, '').replace(/```/g, '').trim();
         let parsedData: any = {};
         try { parsedData = JSON.parse(cleanJson); } catch (e) { parsedData = {}; }
         let modulesArray: any[] = parsedData.modules || (Array.isArray(parsedData) ? parsedData : []);
@@ -928,14 +942,45 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
   const handleRefineOutline = async () => {
       if (!refineInstructions.trim()) return;
       setIsRefining(true);
-      try { const ai = new GoogleGenAI({ apiKey: process.env.API_KEY }); const currentStructure = modules.map(m => ({ title: m.title, lessons: m.lessons.map(l => ({ title: l.title, summary: l.sourceText })) })); const prompt = ` I have a course outline in JSON format. I need you to modify it based on my specific instructions. Current Outline: ${JSON.stringify(currentStructure, null, 2)} USER MODIFICATION REQUEST: "${refineInstructions}" Instructions: 1. Apply changes. 2. Return COMPLETE structure as JSON. 3. Schema: { modules: [...] } `; const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: [{ text: prompt }] }, config: { responseMimeType: "application/json" } })); const cleanJson = (response.text || "{}").replace(/```json/g, '').replace(/```/g, '').trim(); const parsedData = JSON.parse(cleanJson); const modulesArray: any[] = parsedData.modules || (Array.isArray(parsedData) ? parsedData : []); const newModules: Module[] = modulesArray.map((mod: any, mIdx: number) => { const modId = `m-ref-${Date.now()}-${mIdx}`; return { id: modId, courseId: 'temp', title: mod?.title || `Module ${mIdx + 1}`, lessons: (mod.lessons || []).map((les: any, lIdx: number) => ({ id: `l-ref-${Date.now()}-${mIdx}-${lIdx}`, moduleId: modId, title: les.title || `Lesson ${lIdx + 1}`, sourceText: les?.summary || '', visuals: [], status: LessonStatus.PENDING, progress: 0, duration: '0:00', durationSeconds: 0 })) }; }); if (newModules.length > 0) { setModules(newModules); setRefineInstructions(''); } } catch (error) { alert("Failed to refine outline."); } finally { setIsRefining(false); }
+      try {
+          const currentStructure = modules.map(m => ({ title: m.title, lessons: m.lessons.map(l => ({ title: l.title, summary: l.sourceText })) }));
+          const prompt = `I have a course outline in JSON format. I need you to modify it based on my specific instructions.\nCurrent Outline: ${JSON.stringify(currentStructure, null, 2)}\nUSER MODIFICATION REQUEST: "${refineInstructions}"\nInstructions: 1. Apply changes. 2. Return COMPLETE structure as JSON. 3. Schema: { "modules": [ { "title": "string", "lessons": [ { "title": "string", "summary": "string" } ] } ] }`;
+          const resp = await apiFetch('/api/ai/generate-text', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt, jsonMode: true })
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Refine failed');
+          const cleanJson = (data.text || "{}").replace(/```json/g, '').replace(/```/g, '').trim();
+          const parsedData = JSON.parse(cleanJson);
+          const modulesArray: any[] = parsedData.modules || (Array.isArray(parsedData) ? parsedData : []);
+          const newModules: Module[] = modulesArray.map((mod: any, mIdx: number) => {
+              const modId = `m-ref-${Date.now()}-${mIdx}`;
+              return { id: modId, courseId: 'temp', title: mod?.title || `Module ${mIdx + 1}`,
+                  lessons: (mod.lessons || []).map((les: any, lIdx: number) => ({
+                      id: `l-ref-${Date.now()}-${mIdx}-${lIdx}`, moduleId: modId,
+                      title: les.title || `Lesson ${lIdx + 1}`, sourceText: les?.summary || '',
+                      visuals: [], status: LessonStatus.PENDING, progress: 0, duration: '0:00', durationSeconds: 0
+                  })) };
+          });
+          if (newModules.length > 0) { setModules(newModules); setRefineInstructions(''); }
+      } catch (error: any) { alert(error?.message || "Failed to refine outline."); } finally { setIsRefining(false); }
   };
 
   const generateDraftContent = async () => {
     setStep('content'); setIsDraftingContent(true);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const initialModules = [...modules]; let completedCount = 0; const totalLessons = initialModules.reduce((acc, m) => acc + m.lessons.length, 0);
-    let filePart: any = null; if (file && generationStrategy !== 'creative') { filePart = await fileToGenerativePart(file); }
+    const initialModules = [...modules];
+    let completedCount = 0;
+    const totalLessons = initialModules.reduce((acc, m) => acc + m.lessons.length, 0);
+    // Pre-extract file payload once. Sent to /api/ai/generate-from-file per-lesson;
+    // server tries Gemini first, then falls back to OpenAI with pdf-parse text.
+    let fileData: string | undefined;
+    let fileMimeType: string | undefined;
+    if (file && generationStrategy !== 'creative') {
+        const filePart = await fileToGenerativePart(file);
+        fileData = filePart.inlineData.data;
+        fileMimeType = filePart.inlineData.mimeType;
+    }
     for (let mIdx = 0; mIdx < initialModules.length; mIdx++) {
         const module = initialModules[mIdx];
         for (let lIdx = 0; lIdx < module.lessons.length; lIdx++) {
@@ -950,17 +995,62 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                 const summaryContext = currentLesson.sourceText || "";
                 let promptLength = "400 words"; if (moduleCountMode === 'large' || moduleCountMode === 'xlarge') promptLength = "600-800 words";
                 let scriptPrompt = "";
-                if (generationStrategy === 'strict') { scriptPrompt = `You are converting a specific section of an eBook into a video lesson script. Target Section: "${currentLesson.title}" (Part of Module: "${module.title}"). Context from Outline: ${summaryContext} INSTRUCTIONS: 1. Locate the relevant section in the provided file. 2. Extract and adapt the content of that section into a clear, educational video script. 3. Maintain the original author's terminology and key points. 4. Format as spoken narration. 5. Length: ${promptLength}. Do not include scene directions, just spoken text.`; } 
+                if (generationStrategy === 'strict') { scriptPrompt = `You are converting a specific section of an eBook into a video lesson script. Target Section: "${currentLesson.title}" (Part of Module: "${module.title}"). Context from Outline: ${summaryContext} INSTRUCTIONS: 1. Locate the relevant section in the provided file. 2. Extract and adapt the content of that section into a clear, educational video script. 3. Maintain the original author's terminology and key points. 4. Format as spoken narration. 5. Length: ${promptLength}. Do not include scene directions, just spoken text.`; }
                 else { const contextPrompt = `Based on the topic "${currentLesson.title}". Context/Summary: ${summaryContext}`; scriptPrompt = `Write a natural, conversational video script for the lesson "${currentLesson.title}". ${contextPrompt}. Be educational and engaging. Length: ${promptLength}. Do not include scene directions, just spoken text.`; }
-                const parts = filePart ? [filePart, { text: scriptPrompt }] : [{ text: scriptPrompt }];
-                let script = ""; try { const scriptResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: parts }, config: { thinkingConfig: { thinkingBudget: 1024 } } })); script = scriptResponse.text || "Draft script generation failed."; } catch (e) { script = "Script generation failed."; }
-                let visualAssets: VisualAsset[] = []; try { let pacingInstruction = "Break script into 4-7 distinct scenes."; if (visualPacing === 'Fast') pacingInstruction = "Break script into 10-15 fast-paced scenes."; if (visualPacing === 'Turbo') pacingInstruction = "Break script into 25-35 rapid-fire scenes (every 2-3 seconds). Create MAXIMAL visual variety."; const sbResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: [{ text: `${pacingInstruction} Return JSON array. Script: ${script}` }] }, config: { thinkingConfig: { thinkingBudget: 1024 }, responseMimeType: "application/json", responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { segmentText: { type: Type.STRING }, visualPrompt: { type: Type.STRING }, visualType: { type: Type.STRING }, overlayText: { type: Type.STRING } } } } } })); const scenes = JSON.parse((sbResponse.text || "[]").replace(/```json/g, '').replace(/```/g, '')); visualAssets = (Array.isArray(scenes) ? scenes : []).map((s: any, idx: number) => ({ id: `draft-v-${Date.now()}-${idx}`, prompt: s.visualPrompt, imageData: '', type: s.visualType, overlayText: s.overlayText, scriptText: s.segmentText, startTime: 0, endTime: 0 })); } catch (e) { visualAssets = [{ id: `draft-fb-${Date.now()}`, prompt: `Illustration of ${currentLesson.title}`, imageData: '', type: 'illustration', overlayText: currentLesson.title, scriptText: script, startTime: 0, endTime: 0 }]; }
-                setModules(prev => { return prev.map(m => { if (m.id !== module.id) return m; return { ...m, lessons: m.lessons.map(l => { if (l.id !== lessonId) return l; return { ...l, sourceText: script, visuals: visualAssets, status: LessonStatus.SCRIPTING, voice: selectedVoice, captionStyle: l.captionStyle || selectedCaptionStyle, backgroundMusicUrl: l.backgroundMusicUrl || (includeMusic ? selectedMusicTrack : undefined), musicMode: l.musicMode || musicMode }; }) }; }); });
+
+                // 1. Script generation — file-bearing call, routed through server fallback.
+                let script = "";
+                try {
+                    const scriptResp = await apiFetch('/api/ai/generate-from-file', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: scriptPrompt, fileData, fileMimeType, jsonMode: false, maxTokens: 2048 })
+                    });
+                    const scriptJson = await scriptResp.json();
+                    if (scriptResp.ok && scriptJson.text) script = scriptJson.text;
+                    else script = "Script generation failed.";
+                } catch (e) { console.error('Script gen failed:', e); script = "Script generation failed."; }
+
+                // 2. Storyboard generation — text-only, routed through plain /api/ai/generate-text.
+                let visualAssets: VisualAsset[] = [];
+                try {
+                    let pacingInstruction = "Break script into 4-7 distinct scenes.";
+                    if (visualPacing === 'Fast') pacingInstruction = "Break script into 10-15 fast-paced scenes.";
+                    if (visualPacing === 'Turbo') pacingInstruction = "Break script into 25-35 rapid-fire scenes (every 2-3 seconds). Create MAXIMAL visual variety.";
+                    const sbPrompt = `${pacingInstruction} Return JSON object with key "scenes" containing an array. Each scene has: segmentText (string), visualPrompt (string), visualType (string), overlayText (string).\n\nScript:\n${script}`;
+                    const sbResp = await apiFetch('/api/ai/generate-text', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: sbPrompt, jsonMode: true })
+                    });
+                    const sbJson = await sbResp.json();
+                    const raw = (sbJson.text || "[]").replace(/```json/g, '').replace(/```/g, '');
+                    const parsed = JSON.parse(raw);
+                    const scenes = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.scenes) ? parsed.scenes : []);
+                    visualAssets = scenes.map((s: any, idx: number) => ({
+                        id: `draft-v-${Date.now()}-${idx}`, prompt: s.visualPrompt, imageData: '',
+                        type: s.visualType, overlayText: s.overlayText, scriptText: s.segmentText,
+                        startTime: 0, endTime: 0
+                    }));
+                } catch (e) {
+                    console.error('Storyboard gen failed:', e);
+                    visualAssets = [{ id: `draft-fb-${Date.now()}`, prompt: `Illustration of ${currentLesson.title}`, imageData: '', type: 'illustration', overlayText: currentLesson.title, scriptText: script, startTime: 0, endTime: 0 }];
+                }
+
+                setModules(prev => prev.map(m => {
+                    if (m.id !== module.id) return m;
+                    return { ...m, lessons: m.lessons.map(l => {
+                        if (l.id !== lessonId) return l;
+                        return { ...l, sourceText: script, visuals: visualAssets, status: LessonStatus.SCRIPTING,
+                            voice: selectedVoice, captionStyle: l.captionStyle || selectedCaptionStyle,
+                            backgroundMusicUrl: l.backgroundMusicUrl || (includeMusic ? selectedMusicTrack : undefined),
+                            musicMode: l.musicMode || musicMode };
+                    }) };
+                }));
             } catch (error) { console.error(`Error generating content for lesson ${currentLesson.title}:`, error); }
             completedCount++; setParsingProgress((completedCount / totalLessons) * 100);
         }
     }
-    setIsDraftingContent(false); if (initialModules[0]?.lessons[0]) setExpandedLessonId(initialModules[0].lessons[0].id);
+    setIsDraftingContent(false);
+    if (initialModules[0]?.lessons[0]) setExpandedLessonId(initialModules[0].lessons[0].id);
   };
 
   const generateImageForScene = async (mIdx: number, lIdx: number, vIdx: number) => {

@@ -3496,6 +3496,111 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
   return res.status(500).json({ error: 'No AI provider available for text generation' });
 });
 
+// ============ FILE-BEARING GENERATION (PDF/DOCX/TXT outlines + scripts) ============
+// Single endpoint used by CourseWizard's outline + script generators. Tries
+// Gemini (which can natively read PDF/DOCX), falls back to OpenAI with text
+// extracted server-side via pdf-parse (PDF) or direct base64 decode (TXT/MD).
+app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) => {
+  const { prompt, fileData, fileMimeType, jsonMode = false, maxTokens } = req.body;
+
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ error: "Prompt is required" });
+  }
+
+  // Try Gemini with the inline file first (it reads PDF/DOCX/TXT/MD natively).
+  let geminiError: any = null;
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      console.log(`generate-from-file: trying Gemini${fileMimeType ? ` (file: ${fileMimeType})` : ''}...`);
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const parts: any[] = [];
+      if (fileData && fileMimeType) {
+        parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
+      }
+      parts.push({ text: prompt });
+
+      const config: any = {};
+      if (jsonMode) config.responseMimeType = 'application/json';
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: { role: 'user', parts },
+        config,
+      });
+
+      const text = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) {
+        console.log('generate-from-file: Gemini success');
+        return res.json({ text, provider: 'gemini', success: true });
+      }
+      throw new Error('No text in Gemini response');
+    } catch (err: any) {
+      geminiError = err;
+      console.warn('generate-from-file: Gemini failed, trying OpenAI:', String(err?.message || err).slice(0, 200));
+    }
+  }
+
+  // OpenAI fallback. Chat-completions vision doesn't accept PDF/DOCX binaries;
+  // we extract text first and embed it in the prompt.
+  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      let augmentedPrompt = prompt;
+
+      if (fileData && fileMimeType) {
+        if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
+          const buf = Buffer.from(fileData, 'base64');
+          // For full-document tasks (outline, script generation) we want more text
+          // than the metadata path uses. 60k chars ≈ 12-15k tokens, leaving room
+          // for the prompt + JSON response within gpt-4o-mini's 128k context.
+          const extracted = await extractPdfText(buf, 60000);
+          if (extracted) {
+            augmentedPrompt = `${prompt}\n\n---\nSOURCE PDF CONTENT (extracted text, may be truncated):\n${extracted}`;
+          } else {
+            augmentedPrompt = `${prompt}\n\n---\nNote: A PDF was provided but text extraction failed (possibly scanned/image-only PDF). Proceed using the prompt context alone.`;
+          }
+        } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
+          try {
+            const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 60000);
+            augmentedPrompt = `${prompt}\n\n---\nSOURCE FILE CONTENT:\n${decoded}`;
+          } catch {
+            augmentedPrompt = `${prompt}\n\n---\nNote: A text file was provided but could not be decoded.`;
+          }
+        } else if (fileMimeType.includes('wordprocessingml') || /docx?$/i.test(fileMimeType)) {
+          // No mammoth dep — degrade gracefully. User should re-export to PDF or TXT.
+          augmentedPrompt = `${prompt}\n\n---\nNote: A Word document was provided. OpenAI cannot read Word binaries directly. Please ask the user to export to PDF or TXT for fallback support.`;
+        } else if (fileMimeType.startsWith('image/')) {
+          // For images, we'd want to use vision — but outline/script use cases here
+          // are text-based. Note it and proceed without.
+          augmentedPrompt = `${prompt}\n\n---\nNote: An image was provided. Proceed using the prompt context.`;
+        } else {
+          augmentedPrompt = `${prompt}\n\n---\nNote: A file of type ${fileMimeType} was provided but cannot be read by the fallback provider.`;
+        }
+      }
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: augmentedPrompt }],
+        response_format: jsonMode ? { type: 'json_object' } : undefined,
+        max_completion_tokens: maxTokens || 4096,
+      });
+
+      const text = response.choices[0]?.message?.content;
+      if (!text) throw new Error('No text in OpenAI response');
+      console.log('generate-from-file: OpenAI fallback success');
+      return res.json({ text, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+    } catch (err: any) {
+      console.error('generate-from-file: OpenAI failed:', String(err?.message || err).slice(0, 300));
+      return res.status(500).json({
+        error: 'File-bearing generation failed across all providers',
+        geminiError: geminiError ? String(geminiError?.message || geminiError).slice(0, 300) : undefined,
+        openaiError: String(err?.message || err).slice(0, 300),
+      });
+    }
+  }
+
+  return res.status(500).json({ error: 'No AI provider available', details: String(geminiError?.message || geminiError) });
+});
+
 // ============ TAKEAWAYS GENERATION ============
 
 app.post("/api/ai/generate-takeaways", requireRole("CREATOR"), async (req, res) => {
