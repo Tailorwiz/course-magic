@@ -3202,6 +3202,22 @@ app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
 });
 
 // AI Metadata Generation endpoint - generates headlines/descriptions from files
+// Extract plain text from a DOCX buffer using mammoth. Word's modern .docx
+// format is a zipped XML bundle; mammoth pulls out the readable text. The
+// older .doc binary format isn't supported by mammoth — we degrade gracefully
+// in that case and ask the user to re-export.
+async function extractDocxText(buffer: Buffer, maxChars = 60000): Promise<string> {
+  try {
+    const mod: any = await import('mammoth');
+    const mammoth = mod.default || mod;
+    const result = await mammoth.extractRawText({ buffer });
+    return (result?.value || '').slice(0, maxChars).trim();
+  } catch (e: any) {
+    console.warn('mammoth (docx) failed:', String(e?.message || e).slice(0, 200));
+    return '';
+  }
+}
+
 // Extract plain text from a PDF buffer using pdf-parse v2's PDFParse class.
 // Used so OpenAI (which cannot directly read PDF binaries in chat.completions)
 // still has something to work with when Gemini is down.
@@ -3312,8 +3328,8 @@ app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) =
         content.push({ type: 'image_url', image_url: { url: dataUrl } });
       }
 
-      // Source file: images go in as image_url; PDFs get text-extracted first;
-      // text-like files get pasted directly.
+      // Source file: images go in as image_url; PDFs and DOCX get text-extracted
+      // server-side first; text-like files get pasted directly.
       if (fileData && fileMimeType) {
         if (fileMimeType.startsWith('image/')) {
           content.push({ type: 'image_url', image_url: { url: `data:${fileMimeType};base64,${fileData}` } });
@@ -3325,6 +3341,16 @@ app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) =
           } else {
             content.unshift({ type: 'text', text: 'The user uploaded a PDF but text could not be extracted. Use the cover image (if any) and filename as context.' });
           }
+        } else if (fileMimeType.includes('wordprocessingml') || /docx$/i.test(fileMimeType)) {
+          const buf = Buffer.from(fileData, 'base64');
+          const text = await extractDocxText(buf, 8000);
+          if (text) {
+            content.push({ type: 'text', text: `Source DOCX text:\n\n${text}` });
+          } else {
+            content.unshift({ type: 'text', text: 'The user uploaded a Word document but text could not be extracted.' });
+          }
+        } else if (fileMimeType === 'application/msword') {
+          content.unshift({ type: 'text', text: 'A legacy .doc (Word 97-2003) was uploaded. The fallback cannot read this format. Please ask the user to re-save as .docx, PDF, or TXT.' });
         } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
           // For TXT/MD: decode base64 to UTF-8 string.
           try {
@@ -3565,9 +3591,20 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
           } catch {
             augmentedPrompt = `${prompt}\n\n---\nNote: A text file was provided but could not be decoded.`;
           }
-        } else if (fileMimeType.includes('wordprocessingml') || /docx?$/i.test(fileMimeType)) {
-          // No mammoth dep — degrade gracefully. User should re-export to PDF or TXT.
-          augmentedPrompt = `${prompt}\n\n---\nNote: A Word document was provided. OpenAI cannot read Word binaries directly. Please ask the user to export to PDF or TXT for fallback support.`;
+        } else if (fileMimeType.includes('wordprocessingml') || /docx$/i.test(fileMimeType) || fileMimeType === 'application/msword') {
+          // Modern .docx is extractable via mammoth. Older .doc (binary, pre-2007)
+          // is not supported by mammoth — note the limitation.
+          if (fileMimeType === 'application/msword') {
+            augmentedPrompt = `${prompt}\n\n---\nNote: A legacy .doc (Word 97-2003) file was provided. Please re-save as .docx, PDF, or TXT for full text extraction support.`;
+          } else {
+            const buf = Buffer.from(fileData, 'base64');
+            const extracted = await extractDocxText(buf, 60000);
+            if (extracted) {
+              augmentedPrompt = `${prompt}\n\n---\nSOURCE DOCX CONTENT (extracted text, may be truncated):\n${extracted}`;
+            } else {
+              augmentedPrompt = `${prompt}\n\n---\nNote: A Word document was provided but text extraction failed. Proceed using the prompt context alone.`;
+            }
+          }
         } else if (fileMimeType.startsWith('image/')) {
           // For images, we'd want to use vision — but outline/script use cases here
           // are text-based. Note it and proceed without.

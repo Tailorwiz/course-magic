@@ -1135,10 +1135,18 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
       setTotalImagesToGenerate(0);
       setGenerationStartTime(Date.now());
       const scriptStart = Date.now();
-      const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
       try {
-          let filePart: any = null;
-          if (file && strategy !== 'creative') { filePart = await fileToGenerativePart(file); }
+          // Prepare the source file once. Sent to the server endpoint which tries
+          // Gemini first, then falls back to OpenAI with server-side PDF/DOCX text
+          // extraction. This is what lets PDF / TXT / DOCX all work even when
+          // Gemini is unavailable.
+          let fileData: string | undefined;
+          let fileMimeType: string | undefined;
+          if (file && strategy !== 'creative') {
+              const part = await fileToGenerativePart(file);
+              fileData = part.inlineData.data;
+              fileMimeType = part.inlineData.mimeType;
+          }
           const targetWords = VIDEO_DURATIONS.find(d => d.value === durationMode)?.words || 300;
           
           let scriptPrompt = "";
@@ -1263,10 +1271,15 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
 
           const avoidClicheInstruction = "WRITING STYLE: NEVER use cliché buzzwords like 'unlock', 'unleash', 'master', 'supercharge', 'game-changing', 'revolutionary', 'transform your life'. Write in direct, practical language. Get straight to the point.";
           let prompt = `Write a video script about "${details.title}". TARGET LENGTH: Approximately ${targetWords} spoken words. STRATEGY: ${strategy === 'strict' ? 'Strictly summarize the provided file.' : strategy === 'hybrid' ? 'Use the file as a base but add engaging examples.' : 'Be creative and expand on the topic.'} ${scriptPrompt} ${avoidClicheInstruction} FORMAT: Just the spoken text. Do not include camera directions. USER NOTES: ${strategyInstructions}`;
-          
-          const parts = filePart ? [filePart, { text: prompt }] : [{ text: prompt }];
-          const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: selectedAIModel, contents: { parts } }));
-          const generatedScript = response.text || "";
+
+          const scriptResp = await apiFetch('/api/ai/generate-from-file', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt, fileData, fileMimeType, jsonMode: false, maxTokens: 4096 })
+          });
+          const scriptData = await scriptResp.json();
+          if (!scriptResp.ok) throw new Error(scriptData.error || 'Script generation failed');
+          const generatedScript = scriptData.text || "";
           setScriptGenTime(Math.round((Date.now() - scriptStart) / 1000));
           updateActivePart({ script: generatedScript, visuals: [] });
           setStatusMessage("Script generated. Creating storyboard...");
@@ -1276,18 +1289,10 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
           setStoryboardGenTime(Math.round((Date.now() - storyboardStart) / 1000));
           setGenerationStartTime(null);
           setStep('editor');
-      } catch (e: any) { 
-          console.error(e); 
-          const isRateLimit = e?.status === 429 || e?.code === 429 || 
-                             String(e?.message || '').includes('429') || 
-                             String(e?.message || '').includes('quota') ||
-                             String(e?.message || '').includes('RESOURCE_EXHAUSTED');
-          if (isRateLimit) {
-              alert("Gemini API quota exceeded. Please wait a few minutes before trying again, or check your Google AI billing at ai.google.dev/pricing");
-          } else {
-              alert("Failed to generate script. Please try again.");
-          }
-          setGenerationStartTime(null); 
+      } catch (e: any) {
+          console.error('Script generation failed:', e);
+          alert(e?.message || "Failed to generate script. Please try again.");
+          setGenerationStartTime(null);
       } finally { setIsProcessing(false); }
   };
 
@@ -1296,17 +1301,22 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
       setIsRewritingScript(true);
       setRewriteStatusMessage("Analyzing your instructions...");
       try {
-          const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
           setRewriteStatusMessage("AI is rewriting your script...");
           const prompt = `Rewrite the following video script. USER INSTRUCTIONS: "${rewriteInstructions}" CURRENT SCRIPT: "${activePart.script}" Output ONLY the new script text.`;
-          const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: selectedAIModel, contents: { parts: [{ text: prompt }] } }));
-          if (response.text) {
+          const resp = await apiFetch('/api/ai/generate-text', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt, jsonMode: false })
+          });
+          const data = await resp.json();
+          if (resp.ok && data.text) {
               setRewriteStatusMessage("Applying changes...");
-              updateActivePart({ script: response.text });
+              updateActivePart({ script: data.text });
               setRewriteStatusMessage("Done!");
               await new Promise(r => setTimeout(r, 500));
               setShowScriptRewriteModal(false);
               setRewriteInstructions('');
+          } else {
+              throw new Error(data.error || 'Empty response');
           }
       } catch (e) { console.error("Rewrite failed", e); setRewriteStatusMessage("Failed to rewrite. Please try again."); } finally { setIsRewritingScript(false); setRewriteStatusMessage(''); }
   };
@@ -1314,7 +1324,6 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
   // Generate storyboard visuals and return them (for use in contexts where state isn't ready yet)
   const generateStoryboardVisuals = async (currentScript: string, customInstructions: string = ''): Promise<VisualAsset[]> => {
       setStoryboardProgress('Initializing storyboard generation...');
-      const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
       let pacingInstruction = "Break script into distinct visual scenes (approx 1 per 12-15s).";
       if (visualPacing === 'Fast') pacingInstruction = "Break script into double density visual scenes (approx 1 per 6-8s).";
       if (visualPacing === 'Turbo') pacingInstruction = "Break script into rapid-fire visual scenes (every 2-3 seconds).";
@@ -1347,29 +1356,21 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
 
 ), visualType (illustration/photo/diagram), overlayText (text to show on screen - use direct practical language, NEVER use clichés like 'unlock', 'unleash', 'master', 'transform'). IMPORTANT: The segmentText must have normal spacing between words - do not concatenate words together. Script: ${currentScript}`;
       if (customInstructions) { finalPrompt += `\n\nIMPORTANT USER INSTRUCTIONS FOR VISUALS: "${customInstructions}".`; }
+      // OpenAI's json_object response format requires an object root, not array.
+      // Ask for { scenes: [...] } so both providers agree on shape.
+      finalPrompt += `\n\nRETURN JSON: { "scenes": [ { "segmentText": "...", "visualPrompt": "...", "visualType": "...", "overlayText": "..." } ] }`;
       try {
           setStoryboardProgress('Breaking script into visual scenes...');
-          const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ 
-              model: selectedAIModel, 
-              contents: { parts: [{ text: finalPrompt }] }, 
-              config: { 
-                  responseMimeType: "application/json",
-                  responseSchema: { 
-                      type: Type.ARRAY, 
-                      items: { 
-                          type: Type.OBJECT, 
-                          properties: { 
-                              segmentText: { type: Type.STRING }, 
-                              visualPrompt: { type: Type.STRING }, 
-                              visualType: { type: Type.STRING }, 
-                              overlayText: { type: Type.STRING } 
-                          } 
-                      } 
-                  }
-              } 
-          }));
+          const resp = await apiFetch('/api/ai/generate-text', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: finalPrompt, jsonMode: true })
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Storyboard failed');
           setStoryboardProgress('Parsing visual prompts...');
-          const scenes = JSON.parse((response.text || "[]").replace(/```json/g, '').replace(/```/g, ''));
+          const raw = (data.text || "{}").replace(/```json/g, '').replace(/```/g, '');
+          const parsed = JSON.parse(raw);
+          const scenes: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.scenes) ? parsed.scenes : []);
           setStoryboardProgress(`Creating ${scenes.length} scene cards...`);
           const newVisuals: VisualAsset[] = scenes.map((s: any, idx: number) => ({ id: `v-${Date.now()}-${idx}`, prompt: s.visualPrompt || '', imageData: '', type: s.visualType || 'illustration', overlayText: s.overlayText || '', scriptText: fixConcatenatedText(s.segmentText || ''), startTime: 0, endTime: 0 }));
           setStoryboardProgress(`Storyboard complete: ${scenes.length} scenes`);
@@ -1411,10 +1412,14 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
       if (splitInstructions.trim()) {
           setIsProcessing(true); setStatusMessage("Splitting script with AI...");
           try {
-               const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
                const prompt = `Split the following script into exactly ${numParts} distinct parts/episodes. USER INSTRUCTIONS: "${splitInstructions}" SCRIPT: "${activePart.script}" Return a JSON object: { "parts": ["script for part 1", "script for part 2", ...] }`;
-               const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: selectedAIModel, contents: { parts: [{ text: prompt }] }, config: { responseMimeType: "application/json" } }));
-               const json = JSON.parse(response.text || "{}");
+               const resp = await apiFetch('/api/ai/generate-text', {
+                   method: 'POST', headers: { 'Content-Type': 'application/json' },
+                   body: JSON.stringify({ prompt, jsonMode: true })
+               });
+               const data = await resp.json();
+               if (!resp.ok) throw new Error(data.error || 'Split failed');
+               const json = JSON.parse((data.text || "{}").replace(/```json/g, '').replace(/```/g, ''));
                if (json.parts && Array.isArray(json.parts)) {
                    const newParts: VideoPart[] = [];
                    json.parts.forEach((partScript: string, i: number) => { newParts.push({ id: `p-split-${Date.now()}-${i}`, title: `${activePart.title} - Part ${i + 1}`, script: partScript, visuals: [] }); });
@@ -1536,60 +1541,24 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
 
   const [lastAudioError, setLastAudioError] = useState<string>('');
   
-  // Generate key takeaways and action items from script using AI
+  // Generate key takeaways and action items from script using AI.
+  // Routes through the dedicated server endpoint (Gemini -> OpenAI fallback).
   const generateTakeawaysAndActions = async (script: string, title: string): Promise<{ keyTakeaways: string[], actionItems: string[] }> => {
-      const apiKey = getGeminiApiKey();
-      if (!apiKey || !script || script.trim().length < 50) {
+      if (!script || script.trim().length < 50) {
           return { keyTakeaways: [], actionItems: [] };
       }
-      
       try {
           await throttleApiCall(1500);
-          const ai = new GoogleGenAI({ apiKey });
-          const prompt = `Analyze this video script and extract key information.
-
-VIDEO TITLE: ${title}
-
-SCRIPT:
-${script.substring(0, 4000)}
-
-Generate exactly:
-1. 3-5 KEY TAKEAWAYS: The most important concepts or insights from this content
-2. 2-4 ACTION ITEMS: Specific, actionable steps the viewer can take after watching
-
-Respond in this exact JSON format:
-{
-  "keyTakeaways": ["takeaway 1", "takeaway 2", "takeaway 3"],
-  "actionItems": ["action 1", "action 2"]
-}
-
-Keep each item concise (under 100 characters). Focus on practical value.`;
-
-          const response = await withRetry<GenerateContentResponse>(() => 
-              ai.models.generateContent({ 
-                  model: selectedAIModel, 
-                  contents: [{ parts: [{ text: prompt }] }],
-                  config: { 
-                      responseMimeType: 'application/json',
-                      responseSchema: {
-                          type: Type.OBJECT,
-                          properties: {
-                              keyTakeaways: { type: Type.ARRAY, items: { type: Type.STRING } },
-                              actionItems: { type: Type.ARRAY, items: { type: Type.STRING } }
-                          },
-                          required: ['keyTakeaways', 'actionItems']
-                      }
-                  }
-              }), 3, 5000);
-          
-          const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) {
-              const parsed = JSON.parse(text);
-              return {
-                  keyTakeaways: parsed.keyTakeaways || [],
-                  actionItems: parsed.actionItems || []
-              };
-          }
+          const resp = await apiFetch('/api/ai/generate-takeaways', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ script, title })
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Takeaways failed');
+          return {
+              keyTakeaways: Array.isArray(data.keyTakeaways) ? data.keyTakeaways : [],
+              actionItems: Array.isArray(data.actionItems) ? data.actionItems : []
+          };
       } catch (e) {
           console.error('Failed to generate takeaways/actions:', e);
       }
@@ -1888,20 +1857,18 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
       let script = '';
       
       if (newVideoType === 'full') {
-        // Generate script with AI
+        // Generate script with AI (via server with Gemini -> OpenAI fallback)
         const scriptSource = newVideoScriptMode === 'own' ? newVideoScript : newVideoAiPrompt;
         if (scriptSource.trim()) {
-          const apiKey = getGeminiApiKey();
-          if (apiKey && newVideoScriptMode === 'ai') {
+          if (newVideoScriptMode === 'ai') {
             try {
-              const ai = new GoogleGenAI({ apiKey });
               const prompt = `Write a compelling video script about: ${scriptSource}\n\nMake it engaging and conversational, suitable for video narration. About 150-200 words.`;
-              
-              const response = await ai.models.generateContent({ 
-                model: 'gemini-2.5-flash', 
-                contents: [{ role: 'user', parts: [{ text: prompt }] }] 
+              const resp = await apiFetch('/api/ai/generate-text', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt, jsonMode: false })
               });
-              script = response.text || scriptSource;
+              const data = await resp.json();
+              script = (resp.ok && data.text) ? data.text : scriptSource;
             } catch (aiError) {
               console.error('AI script generation failed:', aiError);
               script = scriptSource; // Fallback to the prompt as script
@@ -2834,7 +2801,7 @@ Keep each item concise (under 100 characters). Focus on practical value.`;
                                 </div>
                             </div>
                         ) : (
-                            <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 hover:bg-slate-50 transition-colors relative flex items-center justify-center min-h-[160px]"><input type="file" accept=".pdf,.txt,.md" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" /><div className="flex flex-col items-center gap-3"><div className="bg-indigo-50 p-3 rounded-full">{file ? <CheckCircle2 size={32} className="text-emerald-500" /> : <UploadCloud size={32} className="text-indigo-400" />}</div><div className="text-center"><span className="font-bold text-slate-700 block">{file ? file.name : "Upload Source Document"}</span><span className="text-xs text-slate-500">{file ? "File ready for analysis" : "Supports PDF, TXT, MD (Optional)"}</span></div></div><div className="absolute bottom-4 right-4 z-20"><Button size="sm" variant={file || details.title ? "primary" : "secondary"} className="shadow-md" onClick={(e) => { e.stopPropagation(); generateMetadata('all'); }} disabled={isGeneratingMeta !== null} icon={isGeneratingMeta === 'all' ? <Loader2 size={14} className="animate-spin"/> : <Sparkles size={14}/>}>{isGeneratingMeta === 'all' ? 'Drafting...' : 'Auto-Fill Details'}</Button></div></div>
+                            <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 hover:bg-slate-50 transition-colors relative flex items-center justify-center min-h-[160px]"><input type="file" accept=".pdf,.txt,.md,.doc,.docx" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" /><div className="flex flex-col items-center gap-3"><div className="bg-indigo-50 p-3 rounded-full">{file ? <CheckCircle2 size={32} className="text-emerald-500" /> : <UploadCloud size={32} className="text-indigo-400" />}</div><div className="text-center"><span className="font-bold text-slate-700 block">{file ? file.name : "Upload Source Document"}</span><span className="text-xs text-slate-500">{file ? "File ready for analysis" : "Supports PDF, DOCX, TXT, MD (Optional)"}</span></div></div><div className="absolute bottom-4 right-4 z-20"><Button size="sm" variant={file || details.title ? "primary" : "secondary"} className="shadow-md" onClick={(e) => { e.stopPropagation(); generateMetadata('all'); }} disabled={isGeneratingMeta !== null} icon={isGeneratingMeta === 'all' ? <Loader2 size={14} className="animate-spin"/> : <Sparkles size={14}/>}>{isGeneratingMeta === 'all' ? 'Drafting...' : 'Auto-Fill Details'}</Button></div></div>
                         )}
                         <Input label="Video Title" value={details.title} onChange={e => setDetails({...details, title: e.target.value})} placeholder="e.g. Product Launch Teaser" labelAction={<button onClick={() => generateMetadata('title')} disabled={isGeneratingMeta !== null} className="text-xs text-indigo-600 font-bold hover:bg-indigo-50 px-2 py-1 rounded flex items-center gap-1 transition-colors">{isGeneratingMeta === 'title' ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12}/>} AI Rewrite</button>} />
                         <Input label="Subtitle / Headline" value={details.headline} onChange={e => setDetails({...details, headline: e.target.value})} placeholder="e.g. Master the basics in 5 minutes" labelAction={<button onClick={() => generateMetadata('headline')} disabled={isGeneratingMeta !== null} className="text-xs text-indigo-600 font-bold hover:bg-indigo-50 px-2 py-1 rounded flex items-center gap-1 transition-colors">{isGeneratingMeta === 'headline' ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12}/>} AI Generate</button>} />

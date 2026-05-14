@@ -1501,7 +1501,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                              </div>
 
                              <div className="border-2 border-dashed border-slate-300 rounded-xl p-10 hover:bg-slate-50 transition-colors relative flex items-center justify-center min-h-[200px] group">
-                                <input type="file" accept=".pdf,.txt,.md" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                                <input type="file" accept=".pdf,.txt,.md,.doc,.docx" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
                                 <div className="flex flex-col items-center gap-4 transition-transform group-hover:scale-105">
                                     <div className="bg-indigo-50 p-4 rounded-full">
                                         {file ? <CheckCircle2 size={40} className="text-emerald-500" /> : <UploadCloud size={40} className="text-indigo-400" />}
