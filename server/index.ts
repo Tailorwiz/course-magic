@@ -2963,9 +2963,24 @@ app.get("/api/migrate-media/pending", requireRole("CREATOR"), async (req, res) =
 import OpenAI from "openai";
 import Replicate from "replicate";
 
+// Normalize the OpenAI base URL — OpenAI SDK requires the `/v1` suffix. Some env
+// values are set to just `https://api.openai.com` (missing `/v1`), which would
+// produce 404s on every call. Auto-append it when needed.
+function normalizeOpenAIBaseURL(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.replace(/\/+$/, '');
+  if (/\/v\d+$/.test(trimmed)) return trimmed; // already ends in /v1, /v2, etc.
+  // Standard OpenAI host without a version segment → append /v1
+  if (trimmed === 'https://api.openai.com' || trimmed.endsWith('.openai.com')) {
+    return trimmed + '/v1';
+  }
+  // Other hosts (proxies, gateways): trust what was passed
+  return trimmed;
+}
+
 const openai = new OpenAI({
-  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY,
+  baseURL: normalizeOpenAIBaseURL(process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) || undefined,
 });
 
 // Fallback image generator via OpenAI. Tries gpt-image-1 first (newer, photoreal,
@@ -3098,31 +3113,32 @@ app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
 // AI Cover Generation endpoint - generates book covers with Gemini
 app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
   const { title, headline, instructions, existingImage } = req.body;
-  
+
   if (!title) {
     return res.status(400).json({ error: "Title is required" });
   }
-  
+
+  // Hoisted so the OpenAI fallback in catch() can read it.
+  const isEditing = !!(existingImage && existingImage.startsWith('data:image'));
+
   const geminiKey = process.env.GEMINI_API_KEY;
   if (!geminiKey) {
     return res.status(500).json({ error: 'GEMINI_API_KEY is required for cover generation.' });
   }
-  
+
   try {
     console.log('Generating AI cover with Gemini...');
     const ai = new GoogleGenAI({ apiKey: geminiKey });
-    
+
     const parts: any[] = [];
-    let isEditing = false;
-    
+
     // If existing image provided, add it for editing
-    if (existingImage && existingImage.startsWith('data:image')) {
-      isEditing = true;
+    if (isEditing) {
       const base64Data = existingImage.split(',')[1];
       const mimeType = existingImage.split(';')[0].split(':')[1];
       parts.push({ inlineData: { data: base64Data, mimeType: mimeType } });
     }
-    
+
     // Build prompt
     let prompt = "";
     if (isEditing) {
