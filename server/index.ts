@@ -22,6 +22,7 @@ import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "
 import { GoogleGenAI, Modality } from "@google/genai";
 import { signToken, requireAuth, requireAuthMedia, requireRole, requireSelfOrRole } from "./auth";
 import { enqueueMotionRender, getMotionJob, isRenderBusy } from "./motion";
+import { buildDirectorPrompt, sanitizeScenes } from "./sceneDirector";
 import archiver from "archiver";
 import os from "os";
 import { spawn } from "child_process";
@@ -3605,6 +3606,136 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
   }
   
   return res.status(500).json({ error: 'No AI provider available for text generation' });
+});
+
+// ============ MOTION VIDEO — AI SCENE DIRECTOR ============
+// Turns source content (a script / extracted document / webpage text) into a
+// motion-video scene list. Gemini -> OpenAI fallback; sanitizeScenes() repairs
+// the model's JSON so the render won't fail.
+app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => {
+  const { sourceText, focusInstructions, brandName } = req.body;
+  if (!sourceText || String(sourceText).trim().length < 20) {
+    return res.status(400).json({ error: "sourceText is required (at least 20 characters)" });
+  }
+
+  const prompt = buildDirectorPrompt(String(sourceText), focusInstructions, brandName);
+
+  const parseScenes = (text: string): any[] => {
+    const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+    return sanitizeScenes(JSON.parse(cleaned));
+  };
+
+  // Try Gemini first.
+  let geminiErr = '';
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ parts: [{ text: prompt }] }],
+        config: { responseMimeType: 'application/json' },
+      });
+      const text = response.candidates?.[0]?.content?.parts?.[0]?.text || response.text;
+      const scenes = parseScenes(text || '{}');
+      if (scenes.length > 0) {
+        return res.json({ scenes, provider: 'gemini', success: true });
+      }
+      throw new Error('No usable scenes from Gemini');
+    } catch (e: any) {
+      geminiErr = String(e?.message || e).slice(0, 200);
+      console.warn('Scene director: Gemini failed, trying OpenAI:', geminiErr);
+    }
+  }
+
+  // OpenAI fallback.
+  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 4096,
+      });
+      const scenes = parseScenes(response.choices[0]?.message?.content || '{}');
+      if (scenes.length === 0) throw new Error('No usable scenes from OpenAI');
+      return res.json({ scenes, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+    } catch (e: any) {
+      console.error('Scene director: OpenAI failed:', String(e?.message || e).slice(0, 300));
+      return res.status(500).json({
+        error: 'Scene generation failed across all providers',
+        geminiError: geminiErr || undefined,
+        openaiError: String(e?.message || e).slice(0, 300),
+      });
+    }
+  }
+
+  return res.status(500).json({ error: 'No AI provider available', details: geminiErr });
+});
+
+// ============ MOTION VIDEO — URL CONTENT EXTRACTION ============
+// Fetches a webpage and strips it to readable text, for use as a content
+// source by the AI Scene Director.
+app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: "url is required" });
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url.startsWith('http') ? url : `https://${url}`);
+    } catch {
+      return res.status(400).json({ error: "Invalid URL" });
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return res.status(400).json({ error: "URL must be http or https" });
+    }
+    // SSRF guard — reject private / loopback hosts.
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host.endsWith('.internal') ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+      host === '::1' ||
+      host === '[::1]'
+    ) {
+      return res.status(400).json({ error: "That URL is not allowed" });
+    }
+
+    const resp = await fetch(parsed.toString(), {
+      headers: { 'User-Agent': 'Mozilla/5.0 (CourseMagic content extractor)' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) {
+      return res.status(502).json({ error: `Could not fetch the page (HTTP ${resp.status})` });
+    }
+    const html = await resp.text();
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<(nav|footer|header|aside)[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 14000);
+
+    if (text.length < 40) {
+      return res.status(422).json({ error: "Couldn't extract readable text from that page" });
+    }
+    return res.json({ text, success: true });
+  } catch (e: any) {
+    console.error('extract-url error:', e?.message || e);
+    return res.status(500).json({ error: e?.message || 'URL extraction failed' });
+  }
 });
 
 // ============ FILE-BEARING GENERATION (PDF/DOCX/TXT outlines + scripts) ============
