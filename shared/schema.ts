@@ -95,6 +95,30 @@ export const lessonVideos = pgTable("lesson_videos", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
+// Phase 2: Motion-graphics videos built with the Remotion engine.
+// Each row is one brand-aware animated video — the scene list + brand kit are
+// stored as JSON so the video can be re-rendered or edited later.
+export const motionVideos = pgTable("motion_videos", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  userId: uuid("user_id").notNull(),
+  title: varchar("title", { length: 255 }),
+  // The BrandKit (colors, fonts, logo, tone) the video is themed with.
+  brandKit: jsonb("brand_kit"),
+  // The ordered Scene[] (template + copy + narration per scene).
+  scenes: jsonb("scenes"),
+  // Audio config: music track + mode.
+  audio: jsonb("audio"),
+  // 'draft' | 'rendering' | 'done' | 'error'
+  status: varchar("status", { length: 50 }).notNull().default("draft"),
+  // Supabase Storage path of the rendered MP4 (when done).
+  bucketPath: text("bucket_path"),
+  mimeType: varchar("mime_type", { length: 100 }).default("video/mp4"),
+  durationSec: text("duration_sec"),
+  errorMessage: text("error_message"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
 export const usersRelations = relations(users, ({ many }) => ({
   progress: many(progress),
   tickets: many(tickets),
@@ -117,6 +141,8 @@ export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 export type Course = typeof courses.$inferSelect;
 export type InsertCourse = typeof courses.$inferInsert;
+export type MotionVideo = typeof motionVideos.$inferSelect;
+export type InsertMotionVideo = typeof motionVideos.$inferInsert;
 export type Progress = typeof progress.$inferSelect;
 export type InsertProgress = typeof progress.$inferInsert;
 export type Ticket = typeof tickets.$inferSelect;

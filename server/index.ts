@@ -21,6 +21,7 @@ import { eq, and, sql } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { signToken, requireAuth, requireAuthMedia, requireRole, requireSelfOrRole } from "./auth";
+import { enqueueMotionRender, getMotionJob, isRenderBusy } from "./motion";
 import archiver from "archiver";
 import os from "os";
 import { spawn } from "child_process";
@@ -510,6 +511,56 @@ app.post("/api/tts/elevenlabs", requireAuth, async (req, res) => {
     console.error("ElevenLabs TTS error:", error.message || error);
     return res.status(500).json({ error: error.message || "ElevenLabs TTS failed" });
   }
+});
+
+// ============ MOTION VIDEO (Remotion) ============
+// Phase 2a: render a brand-aware motion-graphics video. The render runs in a
+// subprocess (motion/render-worker.ts); this endpoint returns a jobId the
+// client polls. Per-scene narration TTS + duration derivation happen inside
+// enqueueMotionRender (server/motion.ts).
+app.post("/api/motion/render", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { scenes, brand, voiceId, music, voiceOpts } = req.body;
+
+    if (!Array.isArray(scenes) || scenes.length === 0) {
+      return res.status(400).json({ error: "scenes must be a non-empty array" });
+    }
+    if (!voiceId) {
+      return res.status(400).json({ error: "voiceId is required" });
+    }
+    if (isRenderBusy()) {
+      return res.status(429).json({ error: "A render is already in progress. Try again shortly." });
+    }
+
+    const userId = (req as any).auth?.userId || "anonymous";
+    const jobId = enqueueMotionRender({
+      userId,
+      scenes,
+      brand: brand || {},
+      voiceId,
+      music,
+      voiceOpts,
+    });
+
+    return res.status(202).json({ jobId });
+  } catch (error: any) {
+    console.error("Motion render error:", error?.message || error);
+    return res.status(500).json({ error: error?.message || "Motion render failed to start" });
+  }
+});
+
+// Poll a motion render job's status.
+app.get("/api/motion/render/:jobId", requireAuth, async (req, res) => {
+  const job = getMotionJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Render job not found" });
+  return res.json({
+    status: job.status,
+    progress: job.progress,
+    stage: job.stage,
+    videoUrl: job.videoUrl,
+    durationSec: job.durationSec,
+    error: job.error,
+  });
 });
 
 // ============ STAGED MEDIA UPLOAD ROUTES ============

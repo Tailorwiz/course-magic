@@ -1,6 +1,6 @@
 
 import React from 'react';
-import { LayoutDashboard, BookOpen, GraduationCap, Settings, LogOut, PlusCircle, FlaskConical, Users, User, Video, Briefcase, Award, ShieldCheck, LifeBuoy, MessageSquare, Bug, Inbox, X, FolderOpen, Wrench } from 'lucide-react';
+import { LayoutDashboard, BookOpen, GraduationCap, Settings, LogOut, PlusCircle, FlaskConical, Users, User, Video, Briefcase, Award, ShieldCheck, LifeBuoy, MessageSquare, Bug, Inbox, X, FolderOpen, Wrench, Film } from 'lucide-react';
 import { UserRole } from '../types';
 
 interface SidebarProps {
@@ -118,11 +118,17 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentView, setView, role, sw
                       active={currentView === 'create_course'} 
                       onClick={() => handleNavigation('create_course')} 
                     />
-                    <NavItem 
-                      icon={<Video />} 
-                      label="New Video" 
-                      active={currentView === 'create_video' || currentView === 'select_video_type'} 
-                      onClick={() => handleNavigation('select_video_type')} 
+                    <NavItem
+                      icon={<Video />}
+                      label="New Video"
+                      active={currentView === 'create_video' || currentView === 'select_video_type'}
+                      onClick={() => handleNavigation('select_video_type')}
+                    />
+                    <NavItem
+                      icon={<Film />}
+                      label="Motion Video"
+                      active={currentView === 'motion_video'}
+                      onClick={() => handleNavigation('motion_video')}
                     />
                   </div>
                 </div>

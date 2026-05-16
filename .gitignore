@@ -12,6 +12,10 @@ dist/
 build/
 .vite/
 
+# Motion engine render outputs + Remotion cache
+motion/out/
+.remotion/
+
 # IDE
 .idea/
 .vscode/

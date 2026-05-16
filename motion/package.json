@@ -1,0 +1,26 @@
+{
+  "name": "course-magic-motion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remotion motion-graphics video engine for Course Magic — brand-aware animated explainer videos.",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render",
+    "build": "remotion bundle"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.462",
+    "@remotion/cli": "4.0.462",
+    "@remotion/google-fonts": "4.0.462",
+    "@remotion/renderer": "4.0.462",
+    "@remotion/transitions": "^4.0.462",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.462",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "typescript": "5.9.3"
+  }
+}

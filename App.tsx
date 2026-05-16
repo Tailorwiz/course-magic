@@ -4,6 +4,7 @@ import { Sidebar } from './components/Sidebar';
 import { CreatorDashboard } from './views/CreatorDashboard';
 import { CourseWizard } from './views/CourseWizard';
 import { VideoWizard } from './views/VideoWizard';
+import { MotionVideoWizard } from './views/MotionVideoWizard';
 import { StudentPortal } from './views/StudentPortal';
 import { TestGenerator } from './views/TestGenerator';
 import { LoginPage } from './views/LoginPage';
@@ -873,6 +874,8 @@ export const App = () => {
                       onCreateCourse={async (course) => { await saveCourse(course); setCurrentView('dashboard'); }}
                       onCancel={() => setCurrentView('dashboard')}
                   />;
+              case 'motion_video':
+                  return <MotionVideoWizard onCancel={() => setCurrentView('dashboard')} />;
               case 'edit_course':
                   return editingCourse ? (
                       <CourseOutlineEditor
