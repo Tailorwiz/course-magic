@@ -595,6 +595,61 @@ app.post("/api/motion/upload-asset", requireRole("CREATOR"), upload.single("file
   }
 });
 
+// Capture a screenshot of a webpage for use as a motion-video media scene.
+// The Railway container has no Chromium (rendering is on Lambda), so this uses
+// a free, no-key screenshot service, then stores the image in Supabase.
+app.post("/api/motion/capture-url", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ error: "url is required" });
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url.startsWith("http") ? url : `https://${url}`);
+    } catch {
+      return res.status(400).json({ error: "Invalid URL" });
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return res.status(400).json({ error: "URL must be http or https" });
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host.endsWith(".internal") ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    ) {
+      return res.status(400).json({ error: "That URL is not allowed" });
+    }
+
+    // thum.io renders the page on demand and returns the image directly.
+    const shotUrl = `https://image.thum.io/get/width/1280/crop/720/${parsed.toString()}`;
+    const shotResp = await fetch(shotUrl, { signal: AbortSignal.timeout(30000) });
+    if (!shotResp.ok) {
+      return res.status(502).json({ error: `Screenshot service error (HTTP ${shotResp.status})` });
+    }
+    const buf = Buffer.from(await shotResp.arrayBuffer());
+    if (buf.length < 1000) {
+      return res.status(502).json({ error: "Screenshot came back empty — try again" });
+    }
+
+    const storage = getSupabaseStorage();
+    if (!storage) return res.status(500).json({ error: "Storage not configured" });
+    const userId = (req as any).auth?.userId || "anon";
+    const objectPath = `motion/assets/${userId}/${crypto.randomUUID()}.jpg`;
+    const { error } = await storage.storage
+      .from(STORAGE_BUCKET)
+      .upload(objectPath, buf, { contentType: "image/jpeg", upsert: true, cacheControl: "86400" });
+    if (error) throw new Error(error.message);
+
+    return res.json({ url: bucketPublicUrl(objectPath) });
+  } catch (e: any) {
+    console.error("Motion capture-url error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "URL capture failed" });
+  }
+});
+
 // ============ STAGED MEDIA UPLOAD ROUTES ============
 
 app.post("/api/media/upload", requireRole("CREATOR"), async (req, res) => {

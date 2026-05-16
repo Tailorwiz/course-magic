@@ -21,6 +21,23 @@ interface MotionVideoWizardProps {
   onCancel: () => void;
 }
 
+/**
+ * Parse a fetch Response as JSON, but turn an empty/non-JSON body (which
+ * happens when the API server is mid-restart) into a clear message instead
+ * of the cryptic "Unexpected end of JSON input".
+ */
+async function readJson(r: Response): Promise<any> {
+  const text = await r.text();
+  if (!text || !text.trim()) {
+    throw new Error('The server didn’t respond — it may be restarting. Wait a few seconds and try again.');
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('The server returned an unexpected response. Try again in a moment.');
+  }
+}
+
 // --- Voice + music options --------------------------------------------------
 
 const VOICES = [
@@ -57,12 +74,29 @@ type Scene = SceneCommon & ({ type: 'kineticTitle'; lines: { text: string; accen
   | { type: 'quoteCard'; quote: string; author?: string; role?: string }
   | { type: 'checklist'; title?: string; items: string[] }
   | { type: 'timeline'; title?: string; events: { when: string; text: string }[] }
-  | { type: 'ctaEndCard'; headline: string; sub?: string; cta: string; url?: string });
+  | { type: 'ctaEndCard'; headline: string; sub?: string; cta: string; url?: string }
+  | { type: 'media'; mediaUrl: string; mediaType: 'image' | 'video'; frame: 'browser' | 'laptop' | 'phone' | 'none'; kenBurns?: boolean; caption?: string });
 
 const SCENE_LABEL: Record<string, string> = {
   kineticTitle: 'Kinetic Title', flowchart: 'Flowchart', bulletBuild: 'Bullet List',
   statCountUp: 'Stat / Number', beforeAfter: 'Before / After', numberedSteps: 'Numbered Steps',
   quoteCard: 'Quote', checklist: 'Checklist', timeline: 'Timeline', ctaEndCard: 'Call to Action',
+  media: 'Product Media',
+};
+
+/** A blank scene of each type, for the "Add scene" picker. */
+const SCENE_DEFAULTS: Record<string, () => Scene> = {
+  kineticTitle: () => ({ type: 'kineticTitle', durationInFrames: 90, narration: '', lines: [{ text: 'Headline' }, { text: '' }] }),
+  bulletBuild: () => ({ type: 'bulletBuild', durationInFrames: 90, narration: '', title: 'Title', bullets: ['Point one', 'Point two'] }),
+  flowchart: () => ({ type: 'flowchart', durationInFrames: 90, narration: '', topTag: '', steps: [{ text: 'Step' }, { text: 'Result', bad: true }] }),
+  statCountUp: () => ({ type: 'statCountUp', durationInFrames: 90, narration: '', value: 100, suffix: '%', label: 'What it means' }),
+  beforeAfter: () => ({ type: 'beforeAfter', durationInFrames: 90, narration: '', before: { heading: 'Before', points: ['Problem'] }, after: { heading: 'After', points: ['Solution'] } }),
+  numberedSteps: () => ({ type: 'numberedSteps', durationInFrames: 90, narration: '', title: 'How it works', steps: [{ title: 'Step one' }, { title: 'Step two' }] }),
+  quoteCard: () => ({ type: 'quoteCard', durationInFrames: 90, narration: '', quote: 'A quote.', author: '', role: '' }),
+  checklist: () => ({ type: 'checklist', durationInFrames: 90, narration: '', title: 'Checklist', items: ['Item one', 'Item two'] }),
+  timeline: () => ({ type: 'timeline', durationInFrames: 90, narration: '', title: 'Timeline', events: [{ when: 'Day 1', text: 'Start' }, { when: 'Day 2', text: 'Finish' }] }),
+  ctaEndCard: () => ({ type: 'ctaEndCard', durationInFrames: 90, narration: '', headline: 'Get started', cta: 'Try it now', url: '' }),
+  media: () => ({ type: 'media', durationInFrames: 120, narration: '', mediaUrl: '', mediaType: 'image', frame: 'browser', kenBurns: true, caption: '' }),
 };
 
 // --- Small list editor ------------------------------------------------------
@@ -114,6 +148,50 @@ const SceneCard: React.FC<{
   onDelete: () => void;
 }> = ({ scene, index, total, onChange, onMove, onDelete }) => {
   const set = (patch: any) => onChange(patch);
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [mediaErr, setMediaErr] = useState('');
+  const [captureUrl, setCaptureUrl] = useState('');
+
+  // Upload a product screenshot / screen recording for a media scene.
+  const onMediaFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setMediaErr('');
+    setMediaBusy(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const resp = await apiFetch('/api/motion/upload-asset', { method: 'POST', body: form });
+      const data = await readJson(resp);
+      if (!resp.ok || !data.url) throw new Error(data.error || 'Upload failed');
+      set({ mediaUrl: data.url, mediaType: file.type.startsWith('video') ? 'video' : 'image' });
+    } catch (err: any) {
+      setMediaErr(err?.message || 'Upload failed');
+    } finally {
+      setMediaBusy(false);
+    }
+  };
+
+  // Capture a screenshot of a website for a media scene.
+  const onCapture = async () => {
+    if (!captureUrl.trim()) return;
+    setMediaErr('');
+    setMediaBusy(true);
+    try {
+      const resp = await apiFetch('/api/motion/capture-url', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: captureUrl.trim() }),
+      });
+      const data = await readJson(resp);
+      if (!resp.ok || !data.url) throw new Error(data.error || 'Capture failed');
+      set({ mediaUrl: data.url, mediaType: 'image' });
+    } catch (err: any) {
+      setMediaErr(err?.message || 'Capture failed');
+    } finally {
+      setMediaBusy(false);
+    }
+  };
+
   return (
     <div className="border border-slate-200 rounded-lg p-4 space-y-3 bg-white">
       <div className="flex items-center justify-between">
@@ -213,6 +291,54 @@ const SceneCard: React.FC<{
           <Input label="URL" value={scene.url || ''} onChange={(e) => set({ url: e.target.value })} />
         </div>
       )}
+      {scene.type === 'media' && (
+        <div className="space-y-3">
+          {scene.mediaUrl ? (
+            <div className="flex items-center gap-3">
+              {scene.mediaType === 'video' ? (
+                <video src={scene.mediaUrl} className="h-24 rounded border border-slate-200" />
+              ) : (
+                <img src={scene.mediaUrl} className="h-24 rounded border border-slate-200 object-contain bg-white" />
+              )}
+              <button onClick={() => set({ mediaUrl: '' })} className="text-slate-400 hover:text-red-500"><Trash2 size={16} /></button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <label className="cursor-pointer border-2 border-dashed border-slate-300 rounded-lg px-3 py-3 flex items-center justify-center gap-2 text-sm text-slate-500 hover:bg-slate-50">
+                {mediaBusy ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
+                {mediaBusy ? 'Working…' : 'Upload screenshot or screen recording'}
+                <input type="file" accept="image/*,video/*" className="hidden" onChange={onMediaFile} disabled={mediaBusy} />
+              </label>
+              <div className="flex gap-2">
+                <input
+                  value={captureUrl}
+                  onChange={(e) => setCaptureUrl(e.target.value)}
+                  placeholder="…or capture a website URL"
+                  className="flex-1 border border-slate-300 rounded-lg p-2 text-sm"
+                />
+                <button onClick={onCapture} disabled={mediaBusy} className="px-3 bg-slate-800 text-white rounded-lg text-sm font-bold disabled:opacity-50">Capture</button>
+              </div>
+            </div>
+          )}
+          {mediaErr && <div className="text-xs text-red-600">{mediaErr}</div>}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-bold text-slate-600 mb-1">Device frame</label>
+              <select value={scene.frame} onChange={(e) => set({ frame: e.target.value })} className="w-full border border-slate-300 rounded-lg p-2 text-sm">
+                <option value="browser">Browser window</option>
+                <option value="laptop">Laptop</option>
+                <option value="phone">Phone</option>
+                <option value="none">No frame</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-2 text-sm font-bold text-slate-600 mt-7">
+              <input type="checkbox" checked={!!scene.kenBurns} onChange={(e) => set({ kenBurns: e.target.checked })} />
+              Ken Burns zoom
+            </label>
+          </div>
+          <Input label="Caption (optional)" value={scene.caption || ''} onChange={(e) => set({ caption: e.target.value })} />
+        </div>
+      )}
     </div>
   );
 };
@@ -248,6 +374,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [logoUploading, setLogoUploading] = useState(false);
   // Style — voice + music
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
+  const [voiceSpeed, setVoiceSpeed] = useState(1.0);
   const [musicUrl, setMusicUrl] = useState(MUSIC[1].url);
   const [musicMode, setMusicMode] = useState<'continuous' | 'introOutro'>('continuous');
 
@@ -296,7 +423,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt }),
         });
-        const d = await r.json();
+        const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'AI script generation failed');
         sourceText = d.text;
       } else if (sourceMode === 'document') {
@@ -309,7 +436,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
             fileData: data, fileMimeType: mimeType, jsonMode: false, maxTokens: 6000,
           }),
         });
-        const d = await r.json();
+        const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that document');
         sourceText = d.text;
       } else if (sourceMode === 'url') {
@@ -318,7 +445,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: urlInput.trim() }),
         });
-        const d = await r.json();
+        const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that URL');
         sourceText = d.text;
       }
@@ -331,7 +458,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sourceText, focusInstructions: focus.trim() || undefined, brandName }),
       });
-      const sd = await sr.json();
+      const sd = await readJson(sr);
       if (!sr.ok || !Array.isArray(sd.scenes) || sd.scenes.length === 0) {
         throw new Error(sd.error || 'The Scene Director could not build scenes — try different content.');
       }
@@ -357,7 +484,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
       const form = new FormData();
       form.append('file', file);
       const resp = await apiFetch('/api/motion/upload-asset', { method: 'POST', body: form });
-      const data = await resp.json();
+      const data = await readJson(resp);
       if (!resp.ok || !data.url) throw new Error(data.error || 'Upload failed');
       setLogoUrl(data.url);
     } catch (err: any) {
@@ -391,14 +518,18 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
       const brand = { name: brandName, primary, accent, tone, logoUrl: logoUrl || undefined };
       const resp = await apiFetch('/api/motion/render', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenes, brand, voiceId, music: { url: musicUrl || undefined, mode: musicMode } }),
+        body: JSON.stringify({
+          scenes, brand, voiceId,
+          voiceOpts: { speed: voiceSpeed },
+          music: { url: musicUrl || undefined, mode: musicMode },
+        }),
       });
-      const data = await resp.json();
+      const data = await readJson(resp);
       if (!resp.ok) throw new Error(data.error || 'Failed to start render');
       const jobId = data.jobId;
       pollRef.current = setInterval(async () => {
         try {
-          const s = await apiFetch(`/api/motion/render/${jobId}`).then((r) => r.json());
+          const s = await apiFetch(`/api/motion/render/${jobId}`).then((r) => readJson(r));
           setProgress(s.progress || 0);
           setStage(s.stage || s.status || '');
           if (s.status === 'done') {
@@ -572,6 +703,21 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                   />
                 ))}
               </div>
+
+              {/* Add a scene of any type */}
+              <div className="flex items-center gap-2 flex-wrap bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <span className="text-sm font-bold text-slate-600 mr-1">Add scene:</span>
+                {Object.keys(SCENE_DEFAULTS).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setScenes((prev) => [...prev, SCENE_DEFAULTS[t]()])}
+                    className="text-xs font-bold text-indigo-600 border border-indigo-200 hover:bg-indigo-50 px-2.5 py-1.5 rounded-md flex items-center gap-1"
+                  >
+                    <Plus size={12} /> {SCENE_LABEL[t]}
+                  </button>
+                ))}
+              </div>
+
               <div className="flex justify-between gap-3">
                 <Button variant="secondary" onClick={() => setStep('source')} icon={<ChevronLeft size={16} />}>Back</Button>
                 <Button onClick={() => setStep('style')} icon={<ChevronRight size={16} />}>Continue to Style</Button>
@@ -631,6 +777,20 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                 <select value={voiceId} onChange={(e) => setVoiceId(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2">
                   {VOICES.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
                 </select>
+                <div className="mt-2">
+                  <label className="block text-xs font-bold text-slate-500 mb-1">
+                    Speaking speed — {voiceSpeed.toFixed(2)}×
+                  </label>
+                  <input
+                    type="range"
+                    min={0.7}
+                    max={1.3}
+                    step={0.05}
+                    value={voiceSpeed}
+                    onChange={(e) => setVoiceSpeed(Number(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
               </div>
               <div>
                 <label className="block text-sm font-bold text-slate-600 mb-1">Background music</label>
