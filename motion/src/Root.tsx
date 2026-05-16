@@ -3,9 +3,9 @@
  *
  * `MotionVideoDynamic` is the composition the server renders: it takes
  * inputProps validated by the Zod schema, and derives its total duration
- * from the per-scene durations via calculateMetadata.
+ * from the per-scene durations (minus transition overlaps) via calculateMetadata.
  *
- * The three sample compositions are kept for Studio preview / visual QA.
+ * The sample compositions are kept for Studio preview / visual QA.
  */
 import React from 'react';
 import { Composition } from 'remotion';
@@ -16,8 +16,9 @@ import {
   BRAND_ALT,
   BRAND_JOBINTEL,
   SCENES_JOBINTEL,
+  SHOWCASE_SCENES,
 } from './sample';
-import { totalDuration } from './scenes';
+import { totalDurationWithTransitions } from './scenes';
 import { motionVideoPropsSchema } from './schema';
 
 const FPS = 30;
@@ -25,7 +26,6 @@ const WIDTH = 1920;
 const HEIGHT = 1080;
 
 export const RemotionRoot: React.FC = () => {
-  const duration = totalDuration(SAMPLE_SCENES);
   return (
     <>
       {/* The composition the server renders — duration derived from inputProps. */}
@@ -37,20 +37,31 @@ export const RemotionRoot: React.FC = () => {
         width={WIDTH}
         height={HEIGHT}
         defaultProps={{
-          scenes: SAMPLE_SCENES,
+          scenes: SHOWCASE_SCENES,
           brand: BRAND_JOBA,
           audio: { musicMode: 'continuous' as const },
         }}
         calculateMetadata={({ props }) => ({
-          durationInFrames: totalDuration(props.scenes),
+          durationInFrames: totalDurationWithTransitions(props.scenes),
         })}
+      />
+
+      {/* Showcase — one of every scene type + transitions, for visual QA. */}
+      <Composition
+        id="Showcase"
+        component={MotionVideo}
+        durationInFrames={totalDurationWithTransitions(SHOWCASE_SCENES)}
+        fps={FPS}
+        width={WIDTH}
+        height={HEIGHT}
+        defaultProps={{ scenes: SHOWCASE_SCENES, brand: BRAND_JOBA }}
       />
 
       {/* Static sample compositions for Studio preview. */}
       <Composition
         id="MotionVideo"
         component={MotionVideo}
-        durationInFrames={duration}
+        durationInFrames={totalDurationWithTransitions(SAMPLE_SCENES)}
         fps={FPS}
         width={WIDTH}
         height={HEIGHT}
@@ -59,7 +70,7 @@ export const RemotionRoot: React.FC = () => {
       <Composition
         id="MotionVideoAltBrand"
         component={MotionVideo}
-        durationInFrames={duration}
+        durationInFrames={totalDurationWithTransitions(SAMPLE_SCENES)}
         fps={FPS}
         width={WIDTH}
         height={HEIGHT}
@@ -68,7 +79,7 @@ export const RemotionRoot: React.FC = () => {
       <Composition
         id="JobIntel360"
         component={MotionVideo}
-        durationInFrames={totalDuration(SCENES_JOBINTEL)}
+        durationInFrames={totalDurationWithTransitions(SCENES_JOBINTEL)}
         fps={FPS}
         width={WIDTH}
         height={HEIGHT}

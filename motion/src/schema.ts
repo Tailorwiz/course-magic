@@ -2,8 +2,8 @@
  * Zod schemas for the motion video input props.
  *
  * Remotion's <Composition schema={...}> validates inputProps against this at
- * render time and in Studio. The server also uses these schemas to validate
- * AI-generated scene lists (Phase 2c) before rendering.
+ * render time and in Studio. The AI Scene Director also validates its
+ * generated scene lists against `sceneSchema` before rendering.
  *
  * These mirror the TypeScript types in scenes.ts and brand/brandKit.ts —
  * keep them in sync.
@@ -44,6 +44,7 @@ const sceneBaseSchema = {
   durationInFrames: z.number().int().positive(),
   narration: z.string().optional(),
   audioUrl: z.string().optional(),
+  transition: z.enum(['fade', 'slide', 'wipe', 'none']).optional(),
 };
 
 export const kineticTitleSceneSchema = z.object({
@@ -71,10 +72,100 @@ export const bulletBuildSceneSchema = z.object({
   bullets: z.array(z.string()).min(1).max(6),
 });
 
+export const statCountUpSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('statCountUp'),
+  value: z.number(),
+  prefix: z.string().optional(),
+  suffix: z.string().optional(),
+  label: z.string(),
+  caption: z.string().optional(),
+});
+
+export const beforeAfterSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('beforeAfter'),
+  before: z.object({ heading: z.string(), points: z.array(z.string()).min(1).max(5) }),
+  after: z.object({ heading: z.string(), points: z.array(z.string()).min(1).max(5) }),
+});
+
+export const numberedStepsSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('numberedSteps'),
+  title: z.string().optional(),
+  steps: z
+    .array(z.object({ title: z.string(), detail: z.string().optional() }))
+    .min(2)
+    .max(5),
+});
+
+export const quoteCardSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('quoteCard'),
+  quote: z.string(),
+  author: z.string().optional(),
+  role: z.string().optional(),
+});
+
+export const checklistSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('checklist'),
+  title: z.string().optional(),
+  items: z.array(z.string()).min(2).max(6),
+});
+
+export const timelineSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('timeline'),
+  title: z.string().optional(),
+  events: z
+    .array(z.object({ when: z.string(), text: z.string() }))
+    .min(2)
+    .max(6),
+});
+
+export const ctaEndCardSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('ctaEndCard'),
+  headline: z.string(),
+  sub: z.string().optional(),
+  cta: z.string(),
+  url: z.string().optional(),
+  showLogo: z.boolean().optional(),
+});
+
+export const mediaSceneSchema = z.object({
+  ...sceneBaseSchema,
+  type: z.literal('media'),
+  mediaUrl: z.string(),
+  mediaType: z.enum(['image', 'video']),
+  frame: z.enum(['browser', 'laptop', 'phone', 'none']),
+  kenBurns: z.boolean().optional(),
+  caption: z.string().optional(),
+  annotations: z
+    .array(
+      z.object({
+        x: z.number(),
+        y: z.number(),
+        label: z.string(),
+        arrow: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+});
+
 export const sceneSchema = z.discriminatedUnion('type', [
   kineticTitleSceneSchema,
   flowchartSceneSchema,
   bulletBuildSceneSchema,
+  statCountUpSceneSchema,
+  beforeAfterSceneSchema,
+  numberedStepsSceneSchema,
+  quoteCardSceneSchema,
+  checklistSceneSchema,
+  timelineSceneSchema,
+  ctaEndCardSceneSchema,
+  mediaSceneSchema,
 ]);
 
 export const videoAudioSchema = z.object({

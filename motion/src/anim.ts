@@ -97,3 +97,25 @@ export const tailFade = (
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
+
+/**
+ * Ken Burns effect — a slow zoom + drift across the whole scene. Returns a CSS
+ * transform string to apply to an image/media element.
+ */
+export const kenBurns = (
+  frame: number,
+  durationInFrames: number,
+  fromScale = 1.0,
+  toScale = 1.12,
+): string => {
+  const t = interpolate(frame, [0, durationInFrames], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+    easing: Easing.inOut(Easing.quad),
+  });
+  const scale = fromScale + (toScale - fromScale) * t;
+  // Gentle diagonal drift, scaled so the zoomed image never reveals an edge.
+  const driftX = -t * 1.5;
+  const driftY = -t * 1.0;
+  return `scale(${scale}) translate(${driftX}%, ${driftY}%)`;
+};

@@ -132,3 +132,87 @@ export const SCENES_JOBINTEL: Scene[] = [
     ],
   },
 ];
+
+/**
+ * Showcase scenes — one of every scene type, for Studio preview / visual QA
+ * of all templates + transitions. Durations are hand-set here (no narration).
+ */
+export const SHOWCASE_SCENES: Scene[] = [
+  {
+    type: 'kineticTitle',
+    durationInFrames: 100,
+    lines: [{ text: 'The motion engine' }, { text: 'every template', accent: 'every template' }],
+  },
+  {
+    type: 'statCountUp',
+    durationInFrames: 110,
+    transition: 'fade',
+    value: 73,
+    suffix: '%',
+    label: 'of recruiters check LinkedIn first',
+    caption: 'Industry survey, 2026',
+  },
+  {
+    type: 'beforeAfter',
+    durationInFrames: 140,
+    transition: 'slide',
+    before: { heading: 'Before', points: ['Generic applications', 'No callbacks', 'Ghosted'] },
+    after: { heading: 'After', points: ['Targeted outreach', 'Real intel', 'Interviews'] },
+  },
+  {
+    type: 'numberedSteps',
+    durationInFrames: 130,
+    transition: 'fade',
+    title: 'How it works',
+    steps: [
+      { title: 'Upload your resume', detail: 'PDF or Word' },
+      { title: 'Get the intel report', detail: 'In minutes' },
+      { title: 'Apply with an edge' },
+    ],
+  },
+  {
+    type: 'quoteCard',
+    durationInFrames: 110,
+    transition: 'wipe',
+    quote: 'This is the unfair advantage every job seeker needs.',
+    author: 'Marcus Hall',
+    role: 'Founder, Results Driven Resumes',
+  },
+  {
+    type: 'checklist',
+    durationInFrames: 130,
+    transition: 'fade',
+    title: 'What you get',
+    items: ['Salary intelligence', 'Recruiter verification', 'Ghost-job detection', 'Tailored outreach'],
+  },
+  {
+    type: 'timeline',
+    durationInFrames: 130,
+    transition: 'slide',
+    title: 'Your job search, upgraded',
+    events: [
+      { when: 'Day 1', text: 'Run the report' },
+      { when: 'Day 2', text: 'Reach out' },
+      { when: 'Day 5', text: 'Land interviews' },
+    ],
+  },
+  {
+    type: 'media',
+    durationInFrames: 120,
+    transition: 'fade',
+    mediaUrl: 'https://picsum.photos/seed/coursemagic/1280/720',
+    mediaType: 'image',
+    frame: 'browser',
+    kenBurns: true,
+    caption: 'See it in action',
+  },
+  {
+    type: 'ctaEndCard',
+    durationInFrames: 120,
+    transition: 'fade',
+    headline: 'Get your unfair advantage',
+    sub: 'Start with one free report',
+    cta: 'Try it now',
+    url: 'jobsondemandacademy.com',
+  },
+];
