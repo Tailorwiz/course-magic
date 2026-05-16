@@ -2998,29 +2998,32 @@ async function generateImageOpenAI(prompt: string, aspectRatio: string = '16:9')
   if (aspectRatio === '16:9' || aspectRatio === '4:3') dalleSize = '1792x1024';
   else if (aspectRatio === '9:16' || aspectRatio === '3:4' || aspectRatio === '2:3') dalleSize = '1024x1792';
 
-  // Attempt 1: gpt-image-1 (Gemini-like quality)
+  // Attempt 1: gpt-image-1 at HIGH quality. Without an explicit quality the API
+  // defaults to 'auto' which usually renders low/medium — visibly soft, flat
+  // images. 'high' gives sharp, detailed, photoreal output (closest to Gemini).
   try {
     const resp = await (openai.images as any).generate({
       model: 'gpt-image-1',
       prompt,
       n: 1,
       size: gptSize,
+      quality: 'high',
     });
     const b64 = resp?.data?.[0]?.b64_json;
     if (b64) return { b64, model: 'gpt-image-1' };
     throw new Error('gpt-image-1 returned no b64_json');
   } catch (err: any) {
-    console.warn('gpt-image-1 failed, trying dall-e-3:', String(err?.message || err).slice(0, 200));
+    console.warn('gpt-image-1 (high) failed, trying dall-e-3:', String(err?.message || err).slice(0, 200));
   }
 
-  // Attempt 2: dall-e-3
+  // Attempt 2: dall-e-3 at HD quality (was 'standard' — noticeably softer).
   const resp = await (openai.images as any).generate({
     model: 'dall-e-3',
     prompt,
     n: 1,
     size: dalleSize,
     response_format: 'b64_json',
-    quality: 'standard',
+    quality: 'hd',
   });
   const b64 = resp?.data?.[0]?.b64_json;
   if (!b64) throw new Error('dall-e-3 returned no b64_json');
