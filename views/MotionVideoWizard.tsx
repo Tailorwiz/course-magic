@@ -14,7 +14,7 @@ import { apiFetch } from '../api';
 import { Button } from '../components/Button';
 import { Input, TextArea } from '../components/Input';
 import {
-  Sparkles, Loader2, Film, Play, Download, Plus, Trash2, ChevronLeft,
+  Sparkles, Loader2, Film, Play, Download, Plus, Trash2, ChevronLeft, Upload,
 } from 'lucide-react';
 
 interface MotionVideoWizardProps {
@@ -84,6 +84,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [accent, setAccent] = useState('#ff5a1f');
   const [tone, setTone] = useState<'bold' | 'calm' | 'corporate'>('bold');
   const [logoUrl, setLogoUrl] = useState('');
+  const [logoUploading, setLogoUploading] = useState(false);
 
   // Voice + music
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
@@ -103,6 +104,30 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
 
   const updateScene = (i: number, patch: Partial<Scene>) => {
     setScenes((prev) => prev.map((s, idx) => (idx === i ? ({ ...s, ...patch } as Scene) : s)));
+  };
+
+  // Upload a logo file to Supabase Storage and store its public URL.
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setError('Logo must be an image file (PNG, JPG, SVG).');
+      return;
+    }
+    setError('');
+    setLogoUploading(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const resp = await apiFetch('/api/motion/upload-asset', { method: 'POST', body: form });
+      const data = await resp.json();
+      if (!resp.ok || !data.url) throw new Error(data.error || 'Upload failed');
+      setLogoUrl(data.url);
+    } catch (err: any) {
+      setError(err?.message || 'Logo upload failed');
+    } finally {
+      setLogoUploading(false);
+    }
   };
 
   const startRender = async () => {
@@ -202,7 +227,22 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         <h3 className="font-bold text-slate-700">Brand</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <Input label="Company / brand name" value={brandName} onChange={(e) => setBrandName(e.target.value)} />
-          <Input label="Logo URL (optional)" value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} placeholder="https://…/logo.png" />
+          <div>
+            <label className="block text-sm font-bold text-slate-600 mb-1">Logo (optional)</label>
+            <div className="flex items-center gap-3">
+              <label className="flex-1 cursor-pointer border-2 border-dashed border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-500 hover:bg-slate-50 transition-colors flex items-center gap-2">
+                {logoUploading ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}
+                {logoUploading ? 'Uploading…' : logoUrl ? 'Replace logo' : 'Upload logo image'}
+                <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" disabled={logoUploading} />
+              </label>
+              {logoUrl && (
+                <div className="flex items-center gap-2">
+                  <img src={logoUrl} alt="logo" className="h-10 w-auto max-w-[80px] object-contain border border-slate-200 rounded bg-white p-1" />
+                  <button onClick={() => setLogoUrl('')} className="text-slate-400 hover:text-red-500" title="Remove logo"><Trash2 size={14} /></button>
+                </div>
+              )}
+            </div>
+          </div>
           <div>
             <label className="block text-sm font-bold text-slate-600 mb-1">Primary color</label>
             <input type="color" value={primary} onChange={(e) => setPrimary(e.target.value)} className="w-full h-10 rounded border border-slate-300" />

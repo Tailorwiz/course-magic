@@ -563,6 +563,37 @@ app.get("/api/motion/render/:jobId", requireAuth, async (req, res) => {
   });
 });
 
+// Upload a motion-video asset (logo, product screenshot, etc.) to Supabase
+// Storage and return its public URL. Used by the Motion Video builder so
+// users can upload a logo file instead of pasting a URL.
+app.post("/api/motion/upload-asset", requireRole("CREATOR"), upload.single("file"), async (req, res) => {
+  try {
+    const file = (req as any).file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    const storage = getSupabaseStorage();
+    if (!storage) return res.status(500).json({ error: "Storage not configured" });
+
+    const ext = (file.originalname?.split(".").pop() || "bin").toLowerCase().slice(0, 8);
+    const userId = (req as any).auth?.userId || "anon";
+    const objectPath = `motion/assets/${userId}/${crypto.randomUUID()}.${ext}`;
+
+    const { error } = await storage.storage
+      .from(STORAGE_BUCKET)
+      .upload(objectPath, file.buffer, {
+        contentType: file.mimetype || "application/octet-stream",
+        upsert: true,
+        cacheControl: "86400",
+      });
+    if (error) throw new Error(error.message);
+
+    const url = bucketPublicUrl(objectPath);
+    return res.json({ url });
+  } catch (e: any) {
+    console.error("Motion asset upload error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "Upload failed" });
+  }
+});
+
 // ============ STAGED MEDIA UPLOAD ROUTES ============
 
 app.post("/api/media/upload", requireRole("CREATOR"), async (req, res) => {
