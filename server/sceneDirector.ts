@@ -35,8 +35,10 @@ const TEMPLATE_CATALOG = `
 SCENE TEMPLATES (pick the one that best fits each beat):
 
 1. kineticTitle — a big animated headline. Best for the opening hook and
-   section breaks. JSON: { "type":"kineticTitle", "lines":[{"text":"...","accent":"optional substring of text to color"}], "narration":"spoken line" }
-   1-2 lines. Keep each line under ~6 words.
+   section breaks. JSON: { "type":"kineticTitle", "lines":[{"text":"first line"},{"text":"second line","accent":"a word"}], "narration":"spoken line" }
+   1-2 lines, each under ~6 words. The optional "accent" must be an EXACT word
+   or phrase copied from that same line's "text" — it gets colored. Omit
+   "accent" entirely if you don't want a highlight. Never invent placeholder text.
 
 2. flowchart — a problem/consequence chain. Best for showing how a problem
    cascades. JSON: { "type":"flowchart", "topTag":"short warning label",
@@ -143,7 +145,19 @@ export function sanitizeScenes(raw: any): AnyScene[] {
     switch (type) {
       case 'kineticTitle': {
         const lines = clampArray(s.lines, 1, 3);
-        if (lines) scene = { ...base, lines };
+        if (lines) {
+          // Keep `accent` only when it's a real substring of the line's text —
+          // the model sometimes copies the prompt's placeholder text.
+          const cleanLines = lines.map((ln: any) => {
+            const text = String(ln?.text || '');
+            const accent =
+              typeof ln?.accent === 'string' && ln.accent && text.includes(ln.accent)
+                ? ln.accent
+                : undefined;
+            return accent ? { text, accent } : { text };
+          });
+          scene = { ...base, lines: cleanLines };
+        }
         break;
       }
       case 'flowchart': {
