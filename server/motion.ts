@@ -1,30 +1,56 @@
 /**
  * server/motion.ts — orchestration for the Remotion motion-video pipeline.
  *
- * Responsibilities:
- *  - synthesizeSpeech(): TTS one narration line via ElevenLabs (reused by the
- *    /api/tts/elevenlabs route and the render pipeline).
- *  - enqueueMotionRender(): for a scene list, generate per-scene narration,
- *    derive each scene's duration from the audio, upload assets to Supabase,
- *    then spawn the Remotion render worker as a subprocess.
- *  - An in-memory job map so the client can poll render status.
+ * Phase 2 (Lambda): rendering runs on AWS Lambda via @remotion/lambda, NOT on
+ * the Railway box. The flow:
+ *   1. synthesizeSpeech(): TTS each scene's narration via ElevenLabs.
+ *   2. Derive each scene's duration from the audio; upload narration MP3s to
+ *      Supabase so Lambda can fetch them.
+ *   3. renderMediaOnLambda(): kick off a distributed render on AWS Lambda.
+ *   4. Poll getRenderProgress() until done; the output MP4 lives on S3.
  *
- * The actual render runs in motion/render-worker.ts (a separate process), so
- * the Express event loop is never blocked.
+ * An in-memory job map lets the client poll status. Because the heavy render
+ * happens on Lambda, the Express server stays responsive.
  */
-import { spawn } from 'child_process';
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { createClient } from '@supabase/supabase-js';
+import {
+  renderMediaOnLambda,
+  getRenderProgress,
+  getFunctions,
+} from '@remotion/lambda/client';
 
 const FPS = 30;
 const TAIL_PAD_SEC = 0.6; // silence held after the last spoken word
 const MIN_SCENE_SEC = 1.6; // floor for scenes with no narration
 const STORAGE_BUCKET = 'lesson-media';
 
-// ----- Supabase storage (own client; mirrors server/index.ts helpers) -------
+// ----- Lambda config --------------------------------------------------------
+
+const LAMBDA_REGION = (process.env.REMOTION_LAMBDA_REGION || 'us-east-1') as any;
+const LAMBDA_SERVE_URL =
+  process.env.REMOTION_LAMBDA_SERVE_URL ||
+  'https://remotionlambda-useast1-tqeao6b3l3.s3.us-east-1.amazonaws.com/sites/motion/index.html';
+const LAMBDA_COMPOSITION = 'MotionVideoDynamic';
+// framesPerLambda kept high so a render uses few parallel functions — a fresh
+// AWS account caps Lambda concurrency at 10. Raise the quota in the AWS
+// console for faster renders, then this can be lowered.
+const FRAMES_PER_LAMBDA = 300;
+
+let cachedFunctionName: string | null = process.env.REMOTION_LAMBDA_FUNCTION || null;
+
+/** Find the deployed Remotion render function (cached after first lookup). */
+async function resolveFunctionName(): Promise<string> {
+  if (cachedFunctionName) return cachedFunctionName;
+  const functions = await getFunctions({ region: LAMBDA_REGION, compatibleOnly: true });
+  if (functions.length === 0) {
+    throw new Error('No compatible Remotion Lambda function deployed');
+  }
+  cachedFunctionName = functions[0].functionName;
+  return cachedFunctionName;
+}
+
+// ----- Supabase storage (narration MP3 uploads) -----------------------------
 
 let supabase: ReturnType<typeof createClient> | null = null;
 function getStorage() {
@@ -85,7 +111,6 @@ export async function synthesizeSpeech(
     speed: opts.speed ?? 1.0,
   });
 
-  // Timestamps endpoint first.
   const tsResp = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/with-timestamps`,
     { method: 'POST', headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' }, body },
@@ -151,7 +176,7 @@ function estimateDuration(text: string): number {
 
 // ----- Render jobs ----------------------------------------------------------
 
-export type MotionJobStatus = 'queued' | 'tts' | 'rendering' | 'uploading' | 'done' | 'error';
+export type MotionJobStatus = 'queued' | 'tts' | 'rendering' | 'done' | 'error';
 
 export interface MotionJob {
   id: string;
@@ -159,7 +184,6 @@ export interface MotionJob {
   progress: number; // 0..1 during the render stage
   stage?: string;
   videoUrl?: string;
-  bucketPath?: string;
   durationSec?: number;
   error?: string;
   createdAt: number;
@@ -174,7 +198,7 @@ export function getMotionJob(id: string): MotionJob | undefined {
 
 export interface MotionRenderRequest {
   userId: string;
-  scenes: any[]; // validated Scene[] from the client / scene director
+  scenes: any[];
   brand: Record<string, unknown>;
   voiceId: string;
   music?: { url?: string; mode?: 'continuous' | 'introOutro' | 'none' };
@@ -190,7 +214,6 @@ export function isRenderBusy(): boolean {
 export function enqueueMotionRender(reqData: MotionRenderRequest): string {
   const id = randomUUID();
   jobs.set(id, { id, status: 'queued', progress: 0, createdAt: Date.now() });
-  // Fire and forget — runRender updates the job map as it progresses.
   runRender(id, reqData).catch((err) => {
     const job = jobs.get(id);
     if (job) {
@@ -205,7 +228,7 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
   const job = jobs.get(id)!;
   activeRenders++;
   try {
-    // 1. Per-scene TTS — generate narration, derive durations, upload MP3s.
+    // 1. Per-scene TTS — narration, durations, upload MP3s to Supabase.
     job.status = 'tts';
     const scenes = JSON.parse(JSON.stringify(reqData.scenes)) as any[];
     for (let i = 0; i < scenes.length; i++) {
@@ -217,7 +240,6 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
         scene.audioUrl = await uploadToBucket(audioPath, mp3, 'audio/mpeg');
         scene.durationInFrames = Math.ceil((speech.durationSec + TAIL_PAD_SEC) * FPS);
       } else {
-        // No narration — keep authored duration, or apply the floor.
         scene.durationInFrames =
           scene.durationInFrames || Math.ceil(MIN_SCENE_SEC * FPS);
       }
@@ -233,89 +255,45 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
       },
     };
 
-    // 3. Write the job spec + spawn the render worker.
+    // 3. Render on AWS Lambda.
     job.status = 'rendering';
-    const tmpDir = path.join(os.tmpdir(), 'motion-render', id);
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const outputPath = path.join(tmpDir, 'video.mp4');
-    const specPath = path.join(tmpDir, 'job.json');
-    const cwd = process.cwd();
-    fs.writeFileSync(
-      specPath,
-      JSON.stringify({
-        entryPoint: path.resolve(cwd, 'motion/src/index.ts'),
-        compositionId: 'MotionVideoDynamic',
-        inputProps,
-        outputPath,
-      }),
-    );
+    job.stage = 'render';
+    const functionName = await resolveFunctionName();
+    const { renderId, bucketName } = await renderMediaOnLambda({
+      region: LAMBDA_REGION,
+      functionName,
+      serveUrl: LAMBDA_SERVE_URL,
+      composition: LAMBDA_COMPOSITION,
+      inputProps,
+      codec: 'h264',
+      framesPerLambda: FRAMES_PER_LAMBDA,
+      privacy: 'public',
+      downloadBehavior: { type: 'play-in-browser' },
+    });
 
-    await runWorker(id, specPath);
-
-    // 4. Upload the finished MP4.
-    job.status = 'uploading';
-    const mp4 = fs.readFileSync(outputPath);
-    const videoPath = `motion/${reqData.userId}/${id}/video.mp4`;
-    job.videoUrl = await uploadToBucket(videoPath, mp4, 'video/mp4');
-    job.bucketPath = videoPath;
-    job.status = 'done';
-    job.progress = 1;
-
-    // Clean temp files.
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+    // 4. Poll until the distributed render finishes.
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const progress = await getRenderProgress({
+        renderId,
+        bucketName,
+        functionName,
+        region: LAMBDA_REGION,
+      });
+      if (progress.fatalErrorEncountered) {
+        throw new Error(
+          progress.errors?.[0]?.message || 'Lambda render failed',
+        );
+      }
+      job.progress = progress.overallProgress || 0;
+      if (progress.done) {
+        job.videoUrl = progress.outputFile || undefined;
+        job.status = 'done';
+        job.progress = 1;
+        break;
+      }
     }
   } finally {
     activeRenders--;
   }
-}
-
-/** Spawn motion/render-worker.ts and stream its newline-JSON progress. */
-function runWorker(id: string, specPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const job = jobs.get(id)!;
-    const workerPath = path.resolve(process.cwd(), 'motion/render-worker.ts');
-    const child = spawn('npx', ['tsx', workerPath, specPath], {
-      cwd: process.cwd(),
-      shell: true,
-      env: process.env,
-    });
-
-    let stderr = '';
-    let buffer = '';
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('{')) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg.type === 'progress') {
-            job.progress = msg.value;
-          } else if (msg.type === 'status') {
-            job.stage = msg.stage;
-          } else if (msg.type === 'error') {
-            stderr += msg.message;
-          }
-        } catch {
-          /* ignore non-JSON lines */
-        }
-      }
-    });
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    child.on('error', (err) => reject(err));
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Render worker exited ${code}: ${stderr.slice(-500)}`));
-    });
-  });
 }
