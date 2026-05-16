@@ -1,0 +1,18 @@
+# Never copy local (Windows) build artifacts / deps into the Docker image.
+node_modules
+motion/node_modules
+motion/out
+dist
+.git
+.env
+.env.*
+*.log
+*.mp4
+*.webm
+local-storage
+.vscode
+.idea
+# The motion/ Remotion project is only needed to deploy the Lambda function
+# and S3 site (done from a dev machine). Production renders on Lambda, so the
+# server does not need the motion/ sources or its node_modules.
+motion

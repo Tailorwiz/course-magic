@@ -13,6 +13,10 @@
  * happens on Lambda, the Express server stays responsive.
  */
 import { randomUUID } from 'crypto';
+import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { createClient } from '@supabase/supabase-js';
 import {
   renderMediaOnLambda,
@@ -78,100 +82,82 @@ async function uploadToBucket(
   return bucketPublicUrl(bucketPath);
 }
 
-// ----- TTS ------------------------------------------------------------------
+// ----- Kokoro TTS (self-hosted, free, no datacenter-IP blocking) ------------
+// Mirrors the audiobook-studio app: a Python worker (server/tts_worker.py)
+// runs the open-source Kokoro ONNX model locally. No API, no per-use cost,
+// and — unlike ElevenLabs' free tier — it works from a cloud server.
 
-export interface SpeechResult {
-  audioBase64: string;
-  mimeType: string;
-  wordTimestamps: { word: string; start: number; end: number }[];
-  /** Measured duration in seconds (from the last word timestamp). */
+export const DEFAULT_TTS_VOICE = 'af_heart';
+
+interface KokoroSegment {
+  id: string;
+  text: string;
+}
+interface KokoroResult {
+  id: string;
+  wavPath: string | null;
   durationSec: number;
 }
 
 /**
- * Synthesize one line of narration via ElevenLabs (with word timestamps).
- * Shared by the TTS route and the motion render pipeline.
+ * Synthesize every scene's narration in ONE Kokoro worker invocation.
+ * The Kokoro model takes ~13s to load, so batching all scenes into a single
+ * Python process pays that cost only once per render.
  */
-export async function synthesizeSpeech(
-  text: string,
-  voiceId: string,
-  opts: { stability?: number; similarityBoost?: number; speed?: number; apiKey?: string } = {},
-): Promise<SpeechResult> {
-  const apiKey = process.env.ELEVENLABS_API_KEY || opts.apiKey;
-  if (!apiKey) throw new Error('ElevenLabs API key not configured');
-  if (!text || !voiceId) throw new Error('Missing text or voiceId');
+function synthesizeKokoroBatch(
+  segments: KokoroSegment[],
+  voice: string,
+  speed: number,
+  outDir: string,
+): Promise<KokoroResult[]> {
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(outDir, { recursive: true });
+    const inputPath = path.join(outDir, 'tts-input.json');
+    fs.writeFileSync(inputPath, JSON.stringify({ voice, speed, outDir, segments }));
 
-  const body = JSON.stringify({
-    text,
-    model_id: 'eleven_turbo_v2',
-    voice_settings: {
-      stability: opts.stability ?? 0.5,
-      similarity_boost: opts.similarityBoost ?? 0.75,
-    },
-    speed: opts.speed ?? 1.0,
-  });
+    const workerPath = path.resolve(process.cwd(), 'server/tts_worker.py');
+    const pythonBin = process.env.PYTHON_BIN || 'python3';
+    const child = spawn(pythonBin, [workerPath, inputPath], { env: process.env });
 
-  const tsResp = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/with-timestamps`,
-    { method: 'POST', headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' }, body },
-  );
-
-  const wordTimestamps: { word: string; start: number; end: number }[] = [];
-
-  if (tsResp.ok) {
-    const data: any = await tsResp.json();
-    const alignment = data.alignment || data.normalized_alignment;
-    if (
-      alignment?.characters &&
-      alignment?.character_start_times_seconds &&
-      alignment?.character_end_times_seconds
-    ) {
-      const chars: string[] = alignment.characters;
-      const starts: number[] = alignment.character_start_times_seconds;
-      const ends: number[] = alignment.character_end_times_seconds;
-      let word = '';
-      let wStart = 0;
-      let wEnd = 0;
-      for (let i = 0; i < chars.length; i++) {
-        const c = chars[i];
-        if (c === ' ' || c === '\n' || c === '\t') {
-          if (word.trim()) wordTimestamps.push({ word: word.trim(), start: wStart, end: wEnd });
-          word = '';
-        } else {
-          if (word === '') wStart = starts[i];
-          word += c;
-          wEnd = ends[i];
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c: Buffer) => {
+      stdout += c.toString();
+    });
+    child.stderr.on('data', (c: Buffer) => {
+      stderr += c.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      // The worker prints one JSON object per line; the final `done` line
+      // carries the per-segment results.
+      let doneMsg: any = null;
+      let errMsg: string | null = null;
+      for (const line of stdout.split('\n')) {
+        const t = line.trim();
+        if (!t.startsWith('{')) continue;
+        try {
+          const m = JSON.parse(t);
+          if (m.done) doneMsg = m;
+          if (m.error) errMsg = m.error;
+        } catch {
+          /* ignore non-JSON */
         }
       }
-      if (word.trim()) wordTimestamps.push({ word: word.trim(), start: wStart, end: wEnd });
-    }
-    const durationSec =
-      wordTimestamps.length > 0
-        ? wordTimestamps[wordTimestamps.length - 1].end
-        : estimateDuration(text);
-    return { audioBase64: data.audio_base64, mimeType: 'audio/mpeg', wordTimestamps, durationSec };
-  }
-
-  // Fallback: plain endpoint, no timestamps — estimate duration from word count.
-  const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-    method: 'POST',
-    headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-    body,
+      if (code !== 0 || !doneMsg) {
+        return reject(
+          new Error(errMsg || stderr.slice(-400) || `Kokoro TTS worker exited ${code}`),
+        );
+      }
+      resolve(
+        (doneMsg.results || []).map((r: any) => ({
+          id: String(r.id),
+          wavPath: r.output || null,
+          durationSec: r.duration || 0,
+        })),
+      );
+    });
   });
-  if (!resp.ok) throw new Error(`ElevenLabs error ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  return {
-    audioBase64: buf.toString('base64'),
-    mimeType: 'audio/mpeg',
-    wordTimestamps: [],
-    durationSec: estimateDuration(text),
-  };
-}
-
-/** Rough duration estimate (~2.6 words/sec) when no timestamps are available. */
-function estimateDuration(text: string): number {
-  const words = text.trim().split(/\s+/).filter(Boolean).length;
-  return Math.max(words / 2.6, 1.2);
 }
 
 // ----- Render jobs ----------------------------------------------------------
@@ -227,21 +213,42 @@ export function enqueueMotionRender(reqData: MotionRenderRequest): string {
 async function runRender(id: string, reqData: MotionRenderRequest): Promise<void> {
   const job = jobs.get(id)!;
   activeRenders++;
+  const ttsDir = path.join(os.tmpdir(), 'motion-tts', id);
   try {
-    // 1. Per-scene TTS — narration, durations, upload MP3s to Supabase.
+    // 1. Per-scene TTS via Kokoro — one batched worker call for the whole video.
     job.status = 'tts';
     const scenes = JSON.parse(JSON.stringify(reqData.scenes)) as any[];
-    for (let i = 0; i < scenes.length; i++) {
-      const scene = scenes[i];
+
+    const segments: KokoroSegment[] = [];
+    scenes.forEach((scene, i) => {
       if (scene.narration && String(scene.narration).trim()) {
-        const speech = await synthesizeSpeech(scene.narration, reqData.voiceId, reqData.voiceOpts);
-        const mp3 = Buffer.from(speech.audioBase64, 'base64');
-        const audioPath = `motion/${reqData.userId}/${id}/scene-${i}.mp3`;
-        scene.audioUrl = await uploadToBucket(audioPath, mp3, 'audio/mpeg');
-        scene.durationInFrames = Math.ceil((speech.durationSec + TAIL_PAD_SEC) * FPS);
-      } else {
-        scene.durationInFrames =
-          scene.durationInFrames || Math.ceil(MIN_SCENE_SEC * FPS);
+        segments.push({ id: String(i), text: String(scene.narration) });
+      }
+    });
+
+    if (segments.length > 0) {
+      const results = await synthesizeKokoroBatch(
+        segments,
+        reqData.voiceId || DEFAULT_TTS_VOICE,
+        reqData.voiceOpts?.speed || 1.0,
+        ttsDir,
+      );
+      const byId = new Map(results.map((r) => [r.id, r]));
+      for (let i = 0; i < scenes.length; i++) {
+        const r = byId.get(String(i));
+        if (r && r.wavPath && fs.existsSync(r.wavPath)) {
+          const wav = fs.readFileSync(r.wavPath);
+          const audioPath = `motion/${reqData.userId}/${id}/scene-${i}.wav`;
+          scenes[i].audioUrl = await uploadToBucket(audioPath, wav, 'audio/wav');
+          scenes[i].durationInFrames = Math.ceil((r.durationSec + TAIL_PAD_SEC) * FPS);
+        } else {
+          scenes[i].durationInFrames =
+            scenes[i].durationInFrames || Math.ceil(MIN_SCENE_SEC * FPS);
+        }
+      }
+    } else {
+      for (const s of scenes) {
+        s.durationInFrames = s.durationInFrames || Math.ceil(MIN_SCENE_SEC * FPS);
       }
     }
 
@@ -295,5 +302,10 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
     }
   } finally {
     activeRenders--;
+    try {
+      fs.rmSync(ttsDir, { recursive: true, force: true });
+    } catch {
+      /* ignore temp cleanup errors */
+    }
   }
 }

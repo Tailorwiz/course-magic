@@ -21,15 +21,21 @@ interface MotionVideoWizardProps {
   onCancel: () => void;
 }
 
-// --- Voice + music options (ElevenLabs premade voices; SoundHelix tracks) ---
+// --- Voice + music options ---
+// Voices: Kokoro (free, open-source, self-hosted TTS — same engine as the
+// audiobook app). Music: SoundHelix tracks.
 
 const VOICES = [
-  { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah — reassuring, confident (F)' },
-  { id: 'JBFqnCBsd6RMkjVDRZzb', name: 'George — warm storyteller (M)' },
-  { id: 'IKne3meq5aSn9XLyUdCD', name: 'Charlie — deep, confident (M)' },
-  { id: 'Xb7hH8MSUJpSbSDYk0k2', name: 'Alice — clear educator (F)' },
-  { id: 'cjVigY5qzO86Huf0OWal', name: 'Eric — smooth, trustworthy (M)' },
-  { id: 'FGY2WhTYpPnrIDTdsKH5', name: 'Laura — upbeat, quirky (F)' },
+  { id: 'af_heart', name: 'Heart — warm, expressive (F)' },
+  { id: 'af_bella', name: 'Bella — confident, professional (F)' },
+  { id: 'af_nova', name: 'Nova — clear, authoritative (F)' },
+  { id: 'af_sarah', name: 'Sarah — gentle, sincere (F)' },
+  { id: 'bf_emma', name: 'Emma — elegant British (F)' },
+  { id: 'am_echo', name: 'Echo — smooth, clear (M)' },
+  { id: 'am_adam', name: 'Adam — strong, authoritative (M)' },
+  { id: 'am_onyx', name: 'Onyx — rich, dramatic (M)' },
+  { id: 'am_eric', name: 'Eric — steady, trustworthy (M)' },
+  { id: 'bm_george', name: 'George — refined British (M)' },
 ];
 
 const MUSIC = [
