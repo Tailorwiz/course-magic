@@ -4089,6 +4089,166 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
   }
 });
 
+// ============ MOTION VIDEO — THEME EXTRACTION ============
+// Screenshots a website (or renders a PDF's first page) and uses GPT-4o vision
+// to read its brand identity — colour palette, tone, corner style, typography —
+// so a video can MIRROR the source's look. Best-effort: the wizard treats any
+// failure as "no theme" and falls back to default/manual colours.
+
+/** AI font-style buckets -> concrete Google Font families. Mirrors the curated
+ *  set loaded in motion/src/fonts.ts — keep the two in sync. */
+const FONT_STYLE_MAP: Record<string, { headingFont: string; bodyFont: string }> = {
+  'geometric-sans': { headingFont: 'Montserrat', bodyFont: 'Inter' },
+  'humanist-sans': { headingFont: 'Inter', bodyFont: 'Inter' },
+  rounded: { headingFont: 'Poppins', bodyFont: 'Poppins' },
+  'classic-serif': { headingFont: 'Playfair Display', bodyFont: 'Lora' },
+  'modern-serif': { headingFont: 'Fraunces', bodyFont: 'Inter' },
+  mono: { headingFont: 'Space Grotesk', bodyFont: 'Inter' },
+};
+const THEME_HEX_RE = /^#[0-9a-fA-F]{6}$/;
+
+app.post("/api/ai/extract-theme", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { url, fileData, fileMimeType } = req.body;
+
+    // 1. Get a source image (website screenshot or PDF page 1) as a buffer.
+    let imgBuf: Buffer;
+    let imgMime: string;
+    let sourceKind: 'site' | 'document';
+
+    if (url && typeof url === 'string' && url.trim()) {
+      sourceKind = 'site';
+      let parsed: URL;
+      try {
+        parsed = new URL(url.startsWith('http') ? url : `https://${url}`);
+      } catch {
+        return res.status(400).json({ error: 'Invalid URL' });
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return res.status(400).json({ error: 'URL must be http or https' });
+      }
+      const host = parsed.hostname.toLowerCase();
+      if (
+        host === 'localhost' ||
+        host.endsWith('.internal') ||
+        /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+      ) {
+        return res.status(400).json({ error: 'That URL is not allowed' });
+      }
+      const shotUrl = `https://image.thum.io/get/width/1280/crop/720/${parsed.toString()}`;
+      const shotResp = await fetch(shotUrl, { signal: AbortSignal.timeout(30000) });
+      if (!shotResp.ok) {
+        return res.status(502).json({ error: `Screenshot service error (HTTP ${shotResp.status})` });
+      }
+      imgBuf = Buffer.from(await shotResp.arrayBuffer());
+      imgMime = 'image/jpeg';
+      if (imgBuf.length < 1000) {
+        return res.status(502).json({ error: 'Screenshot came back empty — try again' });
+      }
+    } else if (fileData && typeof fileData === 'string') {
+      sourceKind = 'document';
+      if (!(fileMimeType === 'application/pdf' || /pdf$/i.test(String(fileMimeType || '')))) {
+        return res.status(400).json({
+          error: 'Theme mirroring supports website URLs and PDF documents only.',
+        });
+      }
+      try {
+        const { pdf } = await import('pdf-to-img');
+        const doc = await pdf(Buffer.from(fileData, 'base64'), { scale: 2 });
+        const page1 = await doc.getPage(1);
+        imgBuf = Buffer.isBuffer(page1) ? page1 : Buffer.from(page1);
+        imgMime = 'image/png';
+      } catch (e: any) {
+        return res.status(502).json({
+          error: `Could not render the PDF: ${String(e?.message || e).slice(0, 120)}`,
+        });
+      }
+    } else {
+      return res.status(400).json({ error: 'Provide a url or PDF fileData' });
+    }
+
+    // 2. Ask GPT-4o vision for the brand identity.
+    if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
+      return res.status(500).json({ error: 'No AI provider available for vision' });
+    }
+    const dataUrl = `data:${imgMime};base64,${imgBuf.toString('base64')}`;
+    const visionPrompt = `You are a brand designer. Study this ${
+      sourceKind === 'site' ? 'website screenshot' : 'document page'
+    } and extract its visual brand identity. Return ONLY JSON in exactly this shape:
+{
+  "primary": "#RRGGBB",     // dominant brand colour (buttons, headers, key UI)
+  "accent": "#RRGGBB",      // secondary highlight colour
+  "ink": "#RRGGBB",         // main body text colour (usually near-black)
+  "muted": "#RRGGBB",       // secondary / caption text colour
+  "background": "#RRGGBB",  // main page background
+  "panel": "#RRGGBB",       // card / section surface background
+  "danger": "#RRGGBB",      // a warning/red colour that harmonises with the palette
+  "tone": "bold" | "calm" | "corporate",
+  "radius": 0-28,           // corner roundness: 0-4 sharp, 10-16 medium, 20-28 very rounded
+  "fontStyle": "geometric-sans" | "humanist-sans" | "rounded" | "classic-serif" | "modern-serif" | "mono"
+}
+Every colour MUST be a valid 6-digit hex. Use colours that genuinely appear in the design. If no red is present, choose a red that fits the palette. Pick the fontStyle closest to the headings in the design.`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: visionPrompt },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ] as any,
+        },
+      ],
+      response_format: { type: 'json_object' },
+      max_completion_tokens: 400,
+    });
+    const parsed = JSON.parse(response.choices[0]?.message?.content || '{}');
+
+    // 3. Validate + assemble the theme. Invalid fields are dropped — the
+    //    composition's resolveBrand() fills any gaps from DEFAULT_BRAND.
+    const theme: Record<string, any> = {};
+    for (const k of ['primary', 'accent', 'ink', 'muted', 'background', 'panel', 'danger']) {
+      const v = parsed[k];
+      if (typeof v === 'string' && THEME_HEX_RE.test(v.trim())) theme[k] = v.trim();
+    }
+    if (['bold', 'calm', 'corporate'].includes(parsed.tone)) theme.tone = parsed.tone;
+    if (typeof parsed.radius === 'number' && isFinite(parsed.radius)) {
+      theme.radius = Math.max(0, Math.min(40, Math.round(parsed.radius)));
+    }
+    const fonts = FONT_STYLE_MAP[String(parsed.fontStyle)] || FONT_STYLE_MAP['humanist-sans'];
+    theme.headingFont = fonts.headingFont;
+    theme.bodyFont = fonts.bodyFont;
+
+    if (!theme.primary) {
+      return res.status(502).json({ error: 'Could not read a usable theme from the source' });
+    }
+
+    // 4. Best-effort: store the source image so the UI can preview it.
+    let screenshotUrl = '';
+    try {
+      const storage = getSupabaseStorage();
+      if (storage) {
+        const userId = (req as any).auth?.userId || 'anon';
+        const ext = imgMime === 'image/png' ? 'png' : 'jpg';
+        const objectPath = `motion/assets/${userId}/${crypto.randomUUID()}.${ext}`;
+        const { error } = await storage.storage
+          .from(STORAGE_BUCKET)
+          .upload(objectPath, imgBuf, { contentType: imgMime, upsert: true, cacheControl: '86400' });
+        if (!error) screenshotUrl = bucketPublicUrl(objectPath) || '';
+      }
+    } catch {
+      /* preview image is optional */
+    }
+
+    return res.json({ theme, screenshotUrl, success: true });
+  } catch (e: any) {
+    console.error('extract-theme error:', e?.message || e);
+    return res.status(500).json({ error: e?.message || 'Theme extraction failed' });
+  }
+});
+
 // ============ FILE-BEARING GENERATION (PDF/DOCX/TXT outlines + scripts) ============
 // Single endpoint used by CourseWizard's outline + script generators. Tries
 // Gemini (which can natively read PDF/DOCX), falls back to OpenAI with text

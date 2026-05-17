@@ -443,6 +443,18 @@ const LENGTHS: { id: string; label: string; minutes?: number }[] = [
   { id: 'detailed', label: 'Detailed — about 3-4 minutes', minutes: 3.5 },
 ];
 
+/** Extra BrandKit fields mirrored from a source (beyond primary/accent/tone). */
+type ThemePalette = Partial<{
+  ink: string;
+  muted: string;
+  background: string;
+  panel: string;
+  danger: string;
+  radius: number;
+  headingFont: string;
+  bodyFont: string;
+}>;
+
 export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }) => {
   const [step, setStep] = useState<WizardStep>('source');
   const [error, setError] = useState('');
@@ -455,6 +467,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [urlInput, setUrlInput] = useState('');
   const [focus, setFocus] = useState('');
   const [videoLength, setVideoLength] = useState('auto');
+  const [mirrorTheme, setMirrorTheme] = useState(false);
   const [sourceBusy, setSourceBusy] = useState(false);
 
   // Script (Stage 1 — the full narration script, reviewed before scenes exist)
@@ -477,6 +490,10 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [tone, setTone] = useState<'bold' | 'calm' | 'corporate'>('bold');
   const [logoUrl, setLogoUrl] = useState('');
   const [logoUploading, setLogoUploading] = useState(false);
+  // Theme mirrored from the source (extra BrandKit fields beyond primary/
+  // accent/tone) — applied to the render when set.
+  const [themePalette, setThemePalette] = useState<ThemePalette | null>(null);
+  const [themeScreenshot, setThemeScreenshot] = useState('');
   // Style — voice + music
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [voiceSpeed, setVoiceSpeed] = useState(1.0);
@@ -542,6 +559,28 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         }
       };
 
+      // When "mirror theme" is on, read the source's colors/fonts/style and
+      // apply them to the Style step. Best-effort — a failure is non-fatal.
+      const applyMirroredTheme = async (body: Record<string, unknown>) => {
+        if (!mirrorTheme) return;
+        try {
+          const r = await apiFetch('/api/ai/extract-theme', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const d = await readJson(r);
+          if (!r.ok || !d.theme) return;
+          const { primary: p, accent: a, tone: to, ...rest } = d.theme;
+          if (p) setPrimary(p);
+          if (a) setAccent(a);
+          if (to) setTone(to);
+          setThemePalette(rest as ThemePalette);
+          if (d.screenshotUrl) setThemeScreenshot(d.screenshotUrl);
+        } catch {
+          /* theme mirroring is optional — keep building */
+        }
+      };
+
       if (sourceMode === 'write') {
         rawContent = scriptText.trim();
         if (rawContent.length < 20) throw new Error('Write a longer script (at least a few sentences).');
@@ -569,6 +608,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that document');
         rawContent = d.text;
         autofillBrand(docFile.name.replace(/\.[^.]+$/, ''));
+        await applyMirroredTheme({ fileData: data, fileMimeType: mimeType });
       } else if (sourceMode === 'url') {
         if (!urlInput.trim()) throw new Error('Enter a website URL.');
         const r = await apiFetch('/api/ai/extract-url', {
@@ -581,6 +621,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         if (Array.isArray(d.images)) setSiteImages(d.images);
         if (Array.isArray(d.imageCatalog)) setImageCatalog(d.imageCatalog);
         autofillBrand(d.title);
+        await applyMirroredTheme({ url: urlInput.trim() });
       }
 
       // Stage 1 — the scriptwriter reads the content and writes the full script.
@@ -746,7 +787,13 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
     setStep('rendering');
     if (musicPreviewRef.current) { musicPreviewRef.current.pause(); musicPreviewRef.current = null; }
     try {
-      const brand = { name: brandName, primary, accent, tone, logoUrl: logoUrl || undefined };
+      // themePalette (mirrored ink/bg/fonts/radius…) goes first so the editable
+    // primary/accent/tone pickers always win.
+    const brand = {
+      ...(themePalette || {}),
+      name: brandName, primary, accent, tone,
+      logoUrl: logoUrl || undefined,
+    };
       const resp = await apiFetch('/api/motion/render', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -913,6 +960,24 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                 </p>
               </div>
             )}
+
+            {(sourceMode === 'url' || sourceMode === 'document') && (
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={mirrorTheme}
+                  onChange={(e) => setMirrorTheme(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="text-sm font-bold text-slate-700">Mirror the source&rsquo;s theme</span>
+                  <span className="block text-xs text-slate-400">
+                    Read the {sourceMode === 'url' ? "site's" : "PDF's"} real colors, fonts &amp; style and apply them to the video
+                    {sourceMode === 'document' ? ' (PDFs only)' : ''}.
+                  </span>
+                </span>
+              </label>
+            )}
           </section>
 
           <div className="flex justify-end gap-3">
@@ -1068,6 +1133,39 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                 <option value="corporate">Corporate — crisp, professional</option>
               </select>
             </div>
+
+            {themePalette && (
+              <div className="rounded-lg bg-indigo-50 border border-indigo-100 p-3">
+                <div className="flex items-center gap-2 text-xs font-bold text-indigo-700 mb-2">
+                  <Sparkles size={13} /> Theme mirrored from your {sourceMode === 'document' ? 'PDF' : 'site'}
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex gap-1">
+                    {[primary, accent, themePalette.ink, themePalette.muted, themePalette.background, themePalette.panel, themePalette.danger]
+                      .filter(Boolean)
+                      .map((c, i) => (
+                        <div
+                          key={i}
+                          className="w-6 h-6 rounded border border-slate-300"
+                          style={{ backgroundColor: c as string }}
+                          title={c as string}
+                        />
+                      ))}
+                  </div>
+                  {themePalette.headingFont && (
+                    <span className="text-xs text-slate-500">
+                      Font: <span className="font-bold text-slate-700">{themePalette.headingFont}</span>
+                    </span>
+                  )}
+                  {themeScreenshot && (
+                    <img src={themeScreenshot} alt="source" className="h-10 rounded border border-slate-200" />
+                  )}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-2">
+                  Primary, accent &amp; tone above are editable; the rest of the palette and the font are applied automatically.
+                </p>
+              </div>
+            )}
           </section>
 
           <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
