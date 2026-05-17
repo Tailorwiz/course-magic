@@ -650,6 +650,68 @@ app.post("/api/motion/capture-url", requireRole("CREATOR"), async (req, res) => 
   }
 });
 
+// Search the web for images to use in a motion-video scene. Uses Openverse
+// (700M+ images, free, no key) and — when PEXELS_API_KEY is set — Pexels
+// stock photos. Returns a list of { url, thumb, source } for the user (or the
+// AI Scene Director) to pick from.
+app.post("/api/motion/find-image", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { query, count } = req.body;
+    if (!query || typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ error: "query is required" });
+    }
+    const q = query.trim();
+    const n = Math.min(Math.max(Number(count) || 12, 1), 30);
+    const results: { url: string; thumb: string; source: string }[] = [];
+
+    // Pexels — pro stock photography (only if a key is configured).
+    if (process.env.PEXELS_API_KEY) {
+      try {
+        const r = await fetch(
+          `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=${n}`,
+          { headers: { Authorization: process.env.PEXELS_API_KEY }, signal: AbortSignal.timeout(12000) },
+        );
+        if (r.ok) {
+          const d: any = await r.json();
+          for (const p of d.photos || []) {
+            if (p?.src?.large) {
+              results.push({ url: p.src.large2x || p.src.large, thumb: p.src.medium || p.src.large, source: "pexels" });
+            }
+          }
+        }
+      } catch (e: any) {
+        console.warn("find-image: Pexels failed:", String(e?.message || e).slice(0, 120));
+      }
+    }
+
+    // Openverse — broad web image search, free, no key.
+    try {
+      const r = await fetch(
+        `https://api.openverse.org/v1/images/?q=${encodeURIComponent(q)}&page_size=${n}`,
+        { headers: { "User-Agent": "CourseMagic" }, signal: AbortSignal.timeout(12000) },
+      );
+      if (r.ok) {
+        const d: any = await r.json();
+        for (const p of d.results || []) {
+          if (p?.url) {
+            results.push({ url: p.url, thumb: p.thumbnail || p.url, source: "openverse" });
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn("find-image: Openverse failed:", String(e?.message || e).slice(0, 120));
+    }
+
+    if (results.length === 0) {
+      return res.status(502).json({ error: "No images found — try a different search term" });
+    }
+    return res.json({ images: results.slice(0, n), success: true });
+  } catch (e: any) {
+    console.error("Motion find-image error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "Image search failed" });
+  }
+});
+
 // ============ STAGED MEDIA UPLOAD ROUTES ============
 
 app.post("/api/media/upload", requireRole("CREATOR"), async (req, res) => {
@@ -3823,12 +3885,25 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
     for (const x of extra) {
       if (x) combined += `\n\n=== PAGE: ${x.url} ===\n${x.content}`;
     }
-    combined = combined.slice(0, URL_EXTRACT_MAX_CHARS).trim();
 
+    // 5. Collect images found on the crawled pages (Jina markdown ![..](url)).
+    const allContent = combined;
+    const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
+    const imageSet = new Set<string>();
+    let im: RegExpExecArray | null;
+    while ((im = imgRe.exec(allContent)) !== null && imageSet.size < 40) {
+      const u = im[1];
+      // Skip vector/icon/data assets — keep real photographs.
+      if (/\.(svg|ico)(\?|$)/i.test(u) || u.startsWith('data:')) continue;
+      imageSet.add(u);
+    }
+    const images = [...imageSet];
+
+    combined = combined.slice(0, URL_EXTRACT_MAX_CHARS).trim();
     if (combined.replace(/=== PAGE:[^\n]*\n/g, '').trim().length < 60) {
       return res.status(422).json({ error: "Couldn't extract readable content from that site" });
     }
-    return res.json({ text: combined, pagesRead, success: true });
+    return res.json({ text: combined, pagesRead, images, success: true });
   } catch (e: any) {
     console.error('extract-url error:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'URL extraction failed' });
