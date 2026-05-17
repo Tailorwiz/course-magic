@@ -45,14 +45,24 @@ const MAX_PARALLEL_LAMBDAS = 8;
 
 let cachedFunctionName: string | null = process.env.REMOTION_LAMBDA_FUNCTION || null;
 
-/** Find the deployed Remotion render function (cached after first lookup). */
+/**
+ * Find the best deployed Remotion render function (cached after first lookup).
+ * When several are deployed, prefer the one with the longest timeout (then the
+ * most memory) — so re-deploying a longer-timeout function is picked up
+ * automatically, without touching env vars.
+ */
 async function resolveFunctionName(): Promise<string> {
   if (cachedFunctionName) return cachedFunctionName;
   const functions = await getFunctions({ region: LAMBDA_REGION, compatibleOnly: true });
   if (functions.length === 0) {
     throw new Error('No compatible Remotion Lambda function deployed');
   }
-  cachedFunctionName = functions[0].functionName;
+  const best = [...functions].sort(
+    (a, b) =>
+      (b.timeoutInSeconds ?? 0) - (a.timeoutInSeconds ?? 0) ||
+      (b.memorySizeInMb ?? 0) - (a.memorySizeInMb ?? 0),
+  )[0];
+  cachedFunctionName = best.functionName;
   return cachedFunctionName;
 }
 
