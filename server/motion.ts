@@ -36,10 +36,12 @@ const LAMBDA_SERVE_URL =
   process.env.REMOTION_LAMBDA_SERVE_URL ||
   'https://remotionlambda-useast1-tqeao6b3l3.s3.us-east-1.amazonaws.com/sites/motion/index.html';
 const LAMBDA_COMPOSITION = 'MotionVideoDynamic';
-// framesPerLambda kept high so a render uses few parallel functions — a fresh
-// AWS account caps Lambda concurrency at 10. Raise the quota in the AWS
-// console for faster renders, then this can be lowered.
-const FRAMES_PER_LAMBDA = 300;
+// A fresh AWS account caps Lambda concurrency at ~10. We size each render so it
+// fans out across at most MAX_PARALLEL_LAMBDAS functions (framesPerLambda is
+// computed per-render below). Raising the AWS "Concurrent executions" quota
+// just makes renders faster afterwards — nothing here breaks.
+const MIN_FRAMES_PER_LAMBDA = 300;
+const MAX_PARALLEL_LAMBDAS = 8;
 
 let cachedFunctionName: string | null = process.env.REMOTION_LAMBDA_FUNCTION || null;
 
@@ -266,6 +268,19 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
     job.status = 'rendering';
     job.stage = 'render';
     const functionName = await resolveFunctionName();
+
+    // Size each chunk so the render uses at most MAX_PARALLEL_LAMBDAS parallel
+    // functions — staying within a fresh AWS account's low concurrency cap so
+    // it doesn't fail with "Rate Exceeded".
+    const totalFrames = scenes.reduce(
+      (sum: number, s: any) => sum + (s?.durationInFrames || 90),
+      0,
+    );
+    const framesPerLambda = Math.max(
+      MIN_FRAMES_PER_LAMBDA,
+      Math.ceil(totalFrames / MAX_PARALLEL_LAMBDAS),
+    );
+
     const { renderId, bucketName } = await renderMediaOnLambda({
       region: LAMBDA_REGION,
       functionName,
@@ -273,7 +288,7 @@ async function runRender(id: string, reqData: MotionRenderRequest): Promise<void
       composition: LAMBDA_COMPOSITION,
       inputProps,
       codec: 'h264',
-      framesPerLambda: FRAMES_PER_LAMBDA,
+      framesPerLambda,
       privacy: 'public',
       downloadBehavior: { type: 'play-in-browser' },
     });
