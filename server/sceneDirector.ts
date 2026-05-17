@@ -101,6 +101,8 @@ RULES:
   on-screen copy fields are short and punchy, NOT the same as the narration.
 - Keep all on-screen text short. Long sentences belong only in narration.
 - Use statCountUp only when the source has a real number worth featuring.
+- Optionally give each scene a "transition" — one of: fade, slide, wipe, flip,
+  clockWipe — and vary them across the video for visual interest.
 - Return ONLY JSON, no prose, in exactly this shape:
   { "scenes": [ { ...scene... }, ... ] }
 ${focus}

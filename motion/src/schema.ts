@@ -44,7 +44,7 @@ const sceneBaseSchema = {
   durationInFrames: z.number().int().positive(),
   narration: z.string().optional(),
   audioUrl: z.string().optional(),
-  transition: z.enum(['fade', 'slide', 'wipe', 'none']).optional(),
+  transition: z.enum(['fade', 'slide', 'wipe', 'flip', 'clockWipe', 'none']).optional(),
 };
 
 export const kineticTitleSceneSchema = z.object({

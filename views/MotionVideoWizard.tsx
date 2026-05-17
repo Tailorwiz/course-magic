@@ -63,7 +63,7 @@ const MUSIC = [
 
 // --- Scene model (mirrors motion/src/scenes.ts) -----------------------------
 
-type SceneTransition = 'fade' | 'slide' | 'wipe' | 'none';
+type SceneTransition = 'fade' | 'slide' | 'wipe' | 'flip' | 'clockWipe' | 'none';
 interface SceneCommon { durationInFrames: number; narration?: string; transition?: SceneTransition }
 type Scene = SceneCommon & ({ type: 'kineticTitle'; lines: { text: string; accent?: string }[]; showLogo?: boolean }
   | { type: 'flowchart'; topTag?: string; steps: { text: string; bad?: boolean }[] }

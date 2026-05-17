@@ -12,7 +12,7 @@
  */
 
 /** How a scene transitions in from the previous scene. */
-export type SceneTransition = 'fade' | 'slide' | 'wipe' | 'none';
+export type SceneTransition = 'fade' | 'slide' | 'wipe' | 'flip' | 'clockWipe' | 'none';
 
 /** Fields shared by every scene. */
 export interface SceneBase {

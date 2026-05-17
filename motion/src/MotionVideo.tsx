@@ -14,6 +14,8 @@ import { TransitionSeries, linearTiming } from '@remotion/transitions';
 import { fade } from '@remotion/transitions/fade';
 import { slide } from '@remotion/transitions/slide';
 import { wipe } from '@remotion/transitions/wipe';
+import { flip } from '@remotion/transitions/flip';
+import { clockWipe } from '@remotion/transitions/clock-wipe';
 import type { BrandKit } from './brand/brandKit';
 import { resolveBrand } from './brand/brandKit';
 import type { Scene, SceneTransition, VideoAudio } from './scenes';
@@ -82,6 +84,10 @@ const presentationFor = (t: SceneTransition): any => {
       return slide();
     case 'wipe':
       return wipe();
+    case 'flip':
+      return flip();
+    case 'clockWipe':
+      return clockWipe({ width: 1920, height: 1080 });
     case 'fade':
     default:
       return fade();
