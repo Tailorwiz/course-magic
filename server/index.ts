@@ -534,6 +534,19 @@ app.post("/api/motion/render", requireRole("CREATOR"), async (req, res) => {
     }
 
     const userId = (req as any).auth?.userId || "anonymous";
+
+    // Logo placement: the KineticTitle and CtaEndCard templates only render the
+    // brand logo when the scene has `showLogo: true`. The AI Scene Director
+    // never sets it, so when the brand has a logo we enable it on the opening
+    // kineticTitle and the closing ctaEndCard — the video's intro and outro.
+    if (brand?.logoUrl) {
+      const firstKinetic = scenes.find((s: any) => s?.type === "kineticTitle");
+      if (firstKinetic) firstKinetic.showLogo = true;
+      for (const s of scenes as any[]) {
+        if (s?.type === "ctaEndCard") s.showLogo = true;
+      }
+    }
+
     const jobId = enqueueMotionRender({
       userId,
       scenes,
