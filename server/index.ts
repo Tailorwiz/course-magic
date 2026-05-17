@@ -3864,18 +3864,30 @@ app.post("/api/ai/generate-script", requireRole("CREATOR"), async (req, res) => 
 // Takes the finished script and segments it into a motion-video scene list.
 // sanitizeScenes() repairs the model's JSON so the render won't fail.
 app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => {
-  const { script, sourceText, focusInstructions, brandName } = req.body;
+  const { script, sourceText, focusInstructions, brandName, images } = req.body;
   // `script` is the stage-1 output; `sourceText` kept for backward compatibility.
   const scriptText = String(script || sourceText || '');
   if (!scriptText || scriptText.trim().length < 20) {
     return res.status(400).json({ error: "script is required (at least 20 characters)" });
   }
 
-  const prompt = buildDirectorPrompt(scriptText, focusInstructions, brandName);
+  // Optional images (scraped from the source site) the director may place as
+  // `media` scenes. Normalize to { url, alt }, keep only valid http(s) URLs.
+  const imageList: { url: string; alt: string }[] = (Array.isArray(images) ? images : [])
+    .map((x: any) =>
+      typeof x === 'string'
+        ? { url: x, alt: '' }
+        : { url: String(x?.url || ''), alt: String(x?.alt || '') },
+    )
+    .filter((x: { url: string }) => /^https?:\/\//i.test(x.url))
+    .slice(0, 40);
+  const allowedImageUrls = imageList.map((x) => x.url);
+
+  const prompt = buildDirectorPrompt(scriptText, focusInstructions, brandName, imageList);
 
   const parseScenes = (text: string): any[] => {
     const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-    return sanitizeScenes(JSON.parse(cleaned));
+    return sanitizeScenes(JSON.parse(cleaned), allowedImageUrls);
   };
 
   // Try Gemini first.
@@ -4030,24 +4042,34 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
       if (x) combined += `\n\n=== PAGE: ${x.url} ===\n${x.content}`;
     }
 
-    // 5. Collect images found on the crawled pages (Jina markdown ![..](url)).
+    // 5. Collect images found on the crawled pages (Jina markdown ![alt](url)).
+    // Keep the alt text — the AI Scene Director uses it to match images to
+    // script beats when it places `media` scenes. Junk (logos, favicons,
+    // brand-icon CDNs, sprites, tracking pixels) is filtered out so the AI and
+    // the manual picker only see real content photos/screenshots.
     const allContent = combined;
-    const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
-    const imageSet = new Set<string>();
+    const imgRe = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g;
+    const JUNK_IMG =
+      /(favicon|s2\/favicons|simpleicons|sprite|logo|\bicon|avatar|placeholder|spacer|tracking|pixel|1x1|badge)/i;
+    const imageCatalog: { url: string; alt: string }[] = [];
+    const imgSeen = new Set<string>();
     let im: RegExpExecArray | null;
-    while ((im = imgRe.exec(allContent)) !== null && imageSet.size < 40) {
-      const u = im[1];
-      // Skip vector/icon/data assets — keep real photographs.
-      if (/\.(svg|ico)(\?|$)/i.test(u) || u.startsWith('data:')) continue;
-      imageSet.add(u);
+    while ((im = imgRe.exec(allContent)) !== null && imageCatalog.length < 40) {
+      const u = im[2];
+      const alt = (im[1] || '').trim().slice(0, 140);
+      // Skip vector/icon/data assets and obvious non-content junk.
+      if (/\.(svg|ico)(\?|$)/i.test(u) || u.startsWith('data:') || imgSeen.has(u)) continue;
+      if (JUNK_IMG.test(u) || JUNK_IMG.test(alt)) continue;
+      imgSeen.add(u);
+      imageCatalog.push({ url: u, alt });
     }
-    const images = [...imageSet];
+    const images = imageCatalog.map((x) => x.url);
 
     combined = combined.slice(0, URL_EXTRACT_MAX_CHARS).trim();
     if (combined.replace(/=== PAGE:[^\n]*\n/g, '').trim().length < 60) {
       return res.status(422).json({ error: "Couldn't extract readable content from that site" });
     }
-    return res.json({ text: combined, pagesRead, images, title: pageTitle, success: true });
+    return res.json({ text: combined, pagesRead, images, imageCatalog, title: pageTitle, success: true });
   } catch (e: any) {
     console.error('extract-url error:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'URL extraction failed' });

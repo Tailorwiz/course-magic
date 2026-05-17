@@ -26,8 +26,8 @@
  * scenes are structurally sane so the render does not fail.
  */
 
-/** Scene types the director may emit (every type except `media`, which needs
- *  an uploaded asset and is added by the user, not the AI). */
+/** Text scene types the director picks freely. `media` is handled separately
+ *  in sanitizeScenes — it is only allowed with a real, provided image URL. */
 const DIRECTOR_TYPES = [
   'kineticTitle',
   'flowchart',
@@ -165,28 +165,59 @@ SOURCE CONTENT:
 ${sourceText.slice(0, 60000)}`;
 }
 
+/** An image the director may place into a `media` scene. */
+export interface DirectorImage {
+  url: string;
+  alt: string;
+}
+
 /**
  * Stage 2 — the DIRECTOR prompt.
  *
  * Takes a FINISHED, approved script and turns it into a scene list: segment
  * into beats, fit-match each beat to a template, write the on-screen copy.
+ * When `images` are supplied (scraped from the source website) the director
+ * may also place `media` scenes that show those real images.
  */
 export function buildDirectorPrompt(
   script: string,
   focusInstructions: string | undefined,
   brandName: string | undefined,
+  images: DirectorImage[] = [],
 ): string {
   const focus = focusInstructions?.trim()
     ? `\nFOCUS INSTRUCTIONS FROM THE USER (keep these in mind when choosing emphasis and on-screen wording):\n"${focusInstructions.trim()}"\n`
     : '';
   const brand = brandName?.trim() ? ` for "${brandName.trim()}"` : '';
 
+  // When real images are available, offer the `media` template plus the
+  // catalog of usable image URLs.
+  const imageSection = images.length
+    ? `
+
+11. media — show a REAL image (a screenshot or photo pulled from the source
+    website). JSON: { "type":"media", "mediaUrl":"<one EXACT url from the list
+    below>", "frame":"browser" (for app/website screenshots) or "none" (for
+    photos), "caption":"optional short caption", "narration":"..." }
+
+AVAILABLE IMAGES — for a media scene you may use ONLY these exact URLs:
+${images.map((im, i) => `[${i + 1}] ${im.url}${im.alt ? `  — ${im.alt}` : ''}`).join('\n')}
+
+USE THESE IMAGES — a video with real visuals is far stronger than text alone.
+Place a media scene wherever seeing the real product, screenshot, or photo
+helps the viewer, and when several images genuinely fit, use several media
+scenes — do not settle for just one. But only use an image where its subject
+genuinely matches that beat's narration; skip anything that looks like a logo,
+icon, or decorative graphic. Never invent or alter a URL; copy one exactly
+from the list above.`
+    : '';
+
   return `You are a motion-graphics video director${brand}. The SCRIPT below is
 ALREADY WRITTEN and APPROVED. This is step 2 of 2: turn the finished script into
 an animated scene list. You must NOT rewrite, summarize, shorten, lengthen, or
 add to the script — your job is to stage it, not to write it.
 
-${TEMPLATE_CATALOG}
+${TEMPLATE_CATALOG}${imageSection}
 
 YOUR JOB:
 1. SEGMENT the script into ordered beats. A beat is a short contiguous slice of
@@ -256,7 +287,7 @@ const clampArray = <T>(arr: T[] | undefined, min: number, max: number): T[] | nu
  * default `durationInFrames` (the render pipeline overrides it from narration),
  * and clamps oversized arrays. Returns a clean scene array.
  */
-export function sanitizeScenes(raw: any): AnyScene[] {
+export function sanitizeScenes(raw: any, allowedImageUrls: string[] = []): AnyScene[] {
   const list: any[] = Array.isArray(raw)
     ? raw
     : Array.isArray(raw?.scenes)
@@ -267,7 +298,8 @@ export function sanitizeScenes(raw: any): AnyScene[] {
   for (const s of list) {
     if (!s || typeof s !== 'object') continue;
     const type = String(s.type || '');
-    if (!DIRECTOR_TYPES.includes(type as any)) continue;
+    // `media` is allowed too, but only with an image URL we actually provided.
+    if (type !== 'media' && !DIRECTOR_TYPES.includes(type as any)) continue;
 
     const base: AnyScene = {
       type,
@@ -357,6 +389,25 @@ export function sanitizeScenes(raw: any): AnyScene[] {
             sub: s.sub,
             cta: String(s.cta),
             url: s.url,
+          };
+        }
+        break;
+      }
+      case 'media': {
+        // Only honour a media scene whose image is one we actually provided —
+        // this stops the model inventing or hallucinating image URLs.
+        const url = typeof s.mediaUrl === 'string' ? s.mediaUrl : '';
+        if (url && allowedImageUrls.includes(url)) {
+          const frame = ['browser', 'laptop', 'phone', 'none'].includes(s.frame)
+            ? s.frame
+            : 'none';
+          scene = {
+            ...base,
+            mediaUrl: url,
+            mediaType: 'image',
+            frame,
+            kenBurns: s.kenBurns !== false,
+            caption: typeof s.caption === 'string' && s.caption ? s.caption : undefined,
           };
         }
         break;

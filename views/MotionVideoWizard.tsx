@@ -466,6 +466,9 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [scenesBusy, setScenesBusy] = useState(false);
   const [siteImages, setSiteImages] = useState<string[]>([]);
+  // Images scraped from the source site (with alt text) — the AI Scene
+  // Director uses these to auto-place `media` scenes.
+  const [imageCatalog, setImageCatalog] = useState<{ url: string; alt: string }[]>([]);
 
   // Style — brand
   const [brandName, setBrandName] = useState(DEFAULT_BRAND);
@@ -576,6 +579,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that URL');
         rawContent = d.text;
         if (Array.isArray(d.images)) setSiteImages(d.images);
+        if (Array.isArray(d.imageCatalog)) setImageCatalog(d.imageCatalog);
         autofillBrand(d.title);
       }
 
@@ -624,6 +628,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
           script: fullScript.trim(),
           focusInstructions: focus.trim() || undefined,
           brandName,
+          images: imageCatalog,
         }),
       });
       const sd = await readJson(sr);
