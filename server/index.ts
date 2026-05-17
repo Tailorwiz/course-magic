@@ -22,7 +22,7 @@ import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "
 import { GoogleGenAI, Modality } from "@google/genai";
 import { signToken, requireAuth, requireAuthMedia, requireRole, requireSelfOrRole } from "./auth";
 import { enqueueMotionRender, getMotionJob, isRenderBusy } from "./motion";
-import { buildDirectorPrompt, sanitizeScenes } from "./sceneDirector";
+import { buildScriptPrompt, buildDirectorPrompt, sanitizeScenes } from "./sceneDirector";
 import archiver from "archiver";
 import os from "os";
 import { spawn } from "child_process";
@@ -709,6 +709,63 @@ app.post("/api/motion/find-image", requireRole("CREATOR"), async (req, res) => {
   } catch (e: any) {
     console.error("Motion find-image error:", e?.message || e);
     return res.status(500).json({ error: e?.message || "Image search failed" });
+  }
+});
+
+// Search for background music. Uses Openverse's audio index (free, no key —
+// it aggregates Jamendo, ccMixter, Free Music Archive, Wikimedia and more) and
+// returns playable MP3 URLs the Lambda renderer can fetch directly. Results
+// span many licenses; the UI shows each track's license so the user chooses.
+app.post("/api/motion/find-music", requireRole("CREATOR"), async (req, res) => {
+  try {
+    const { query, count } = req.body;
+    if (!query || typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ error: "query is required" });
+    }
+    const q = query.trim();
+    const n = Math.min(Math.max(Number(count) || 18, 1), 30);
+    const tracks: {
+      url: string;
+      title: string;
+      artist: string;
+      duration: number;
+      license: string;
+      source: string;
+    }[] = [];
+
+    try {
+      const r = await fetch(
+        `https://api.openverse.org/v1/audio/?q=${encodeURIComponent(q)}&category=music&page_size=${n}`,
+        { headers: { "User-Agent": "CourseMagic" }, signal: AbortSignal.timeout(12000) },
+      );
+      if (r.ok) {
+        const d: any = await r.json();
+        for (const t of d.results || []) {
+          if (t?.url) {
+            tracks.push({
+              url: t.url,
+              title: String(t.title || "Untitled").slice(0, 90),
+              artist: String(t.creator || "").slice(0, 60),
+              duration: Number(t.duration) || 0, // milliseconds
+              license: [t.license, t.license_version].filter(Boolean).join(" ").toUpperCase(),
+              source: String(t.source || t.provider || "openverse"),
+            });
+          }
+        }
+      } else {
+        console.warn("find-music: Openverse HTTP", r.status);
+      }
+    } catch (e: any) {
+      console.warn("find-music: Openverse failed:", String(e?.message || e).slice(0, 120));
+    }
+
+    if (tracks.length === 0) {
+      return res.status(502).json({ error: "No music found — try a different search term" });
+    }
+    return res.json({ tracks: tracks.slice(0, n), success: true });
+  } catch (e: any) {
+    console.error("Motion find-music error:", e?.message || e);
+    return res.status(500).json({ error: e?.message || "Music search failed" });
   }
 });
 
@@ -3725,17 +3782,96 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
   return res.status(500).json({ error: 'No AI provider available for text generation' });
 });
 
-// ============ MOTION VIDEO — AI SCENE DIRECTOR ============
-// Turns source content (a script / extracted document / webpage text) into a
-// motion-video scene list. Gemini -> OpenAI fallback; sanitizeScenes() repairs
-// the model's JSON so the render won't fail.
-app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => {
-  const { sourceText, focusInstructions, brandName } = req.body;
-  if (!sourceText || String(sourceText).trim().length < 20) {
-    return res.status(400).json({ error: "sourceText is required (at least 20 characters)" });
+// ============ MOTION VIDEO — AI SCENE DIRECTOR (2-STAGE PIPELINE) ============
+// Source content never becomes scenes directly. It runs through two stages:
+//
+//   Stage 1 — /api/ai/generate-script:  reads ALL the source content and
+//     writes the COMPLETE spoken narration script. The user reviews/edits it.
+//   Stage 2 — /api/ai/generate-scenes:  takes the FINISHED script, segments it
+//     into beats, fit-matches each beat to a template, writes on-screen copy.
+//
+// Both stages use the Gemini -> OpenAI fallback.
+
+// ---- STAGE 1: SCRIPTWRITER ----
+// Reads source content (document text / crawled website / topic brief) and
+// writes the full narration script as plain text.
+app.post("/api/ai/generate-script", requireRole("CREATOR"), async (req, res) => {
+  const { sourceText, focusInstructions, brandName, targetMinutes, fromTopic } = req.body;
+  if (!sourceText || String(sourceText).trim().length < 12) {
+    return res.status(400).json({ error: "sourceText is required (at least 12 characters)" });
   }
 
-  const prompt = buildDirectorPrompt(String(sourceText), focusInstructions, brandName);
+  const minutes =
+    typeof targetMinutes === 'number' && targetMinutes > 0 ? targetMinutes : undefined;
+  const prompt = buildScriptPrompt(String(sourceText), focusInstructions, brandName, {
+    targetMinutes: minutes,
+    fromTopic: !!fromTopic,
+  });
+
+  // Strip code fences and a leading "Here is the script:" style preamble.
+  const cleanScript = (t: string): string =>
+    t
+      .replace(/```/g, '')
+      .replace(/^\s*(here(?:'s| is)|sure[,!]?|below is)[^\n:]*:?\s*/i, '')
+      .trim();
+
+  // Try Gemini first.
+  let geminiErr = '';
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ parts: [{ text: prompt }] }],
+      });
+      const text = response.candidates?.[0]?.content?.parts?.[0]?.text || response.text;
+      const script = cleanScript(text || '');
+      if (script.length >= 40) {
+        return res.json({ script, provider: 'gemini', success: true });
+      }
+      throw new Error('Gemini returned an empty script');
+    } catch (e: any) {
+      geminiErr = String(e?.message || e).slice(0, 200);
+      console.warn('Scriptwriter: Gemini failed, trying OpenAI:', geminiErr);
+    }
+  }
+
+  // OpenAI fallback — gpt-4o (the strong model) for thorough content analysis.
+  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: prompt }],
+        max_completion_tokens: 4000,
+      });
+      const script = cleanScript(response.choices[0]?.message?.content || '');
+      if (script.length < 40) throw new Error('OpenAI returned an empty script');
+      return res.json({ script, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+    } catch (e: any) {
+      console.error('Scriptwriter: OpenAI failed:', String(e?.message || e).slice(0, 300));
+      return res.status(500).json({
+        error: 'Script generation failed across all providers',
+        geminiError: geminiErr || undefined,
+        openaiError: String(e?.message || e).slice(0, 300),
+      });
+    }
+  }
+
+  return res.status(500).json({ error: 'No AI provider available', details: geminiErr });
+});
+
+// ---- STAGE 2: SCENE DIRECTOR ----
+// Takes the finished script and segments it into a motion-video scene list.
+// sanitizeScenes() repairs the model's JSON so the render won't fail.
+app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => {
+  const { script, sourceText, focusInstructions, brandName } = req.body;
+  // `script` is the stage-1 output; `sourceText` kept for backward compatibility.
+  const scriptText = String(script || sourceText || '');
+  if (!scriptText || scriptText.trim().length < 20) {
+    return res.status(400).json({ error: "script is required (at least 20 characters)" });
+  }
+
+  const prompt = buildDirectorPrompt(scriptText, focusInstructions, brandName);
 
   const parseScenes = (text: string): any[] => {
     const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -3771,7 +3907,7 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
         model: 'gpt-4o',
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
-        max_completion_tokens: 6000,
+        max_completion_tokens: 8000,
       });
       const scenes = parseScenes(response.choices[0]?.message?.content || '{}');
       if (scenes.length === 0) throw new Error('No usable scenes from OpenAI');
@@ -3850,6 +3986,14 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
       });
     }
 
+    // Parse the page title (Jina prefixes its output with "Title: ..."). Keep
+    // the brand part before any separator, e.g. "Brand | Tagline" -> "Brand".
+    const titleMatch = entryContent.match(/^Title:\s*(.+)$/m);
+    const pageTitle = (titleMatch?.[1] || '')
+      .split(/\s+[|–—·•\-]\s+/)[0]
+      .trim()
+      .slice(0, 60);
+
     // 2. Discover up to 4 same-domain key pages from the entry page's links.
     const linkRe = /\]\((https?:\/\/[^)\s]+)\)/g;
     const seen = new Set<string>([entryUrl.replace(/\/$/, '')]);
@@ -3903,7 +4047,7 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
     if (combined.replace(/=== PAGE:[^\n]*\n/g, '').trim().length < 60) {
       return res.status(422).json({ error: "Couldn't extract readable content from that site" });
     }
-    return res.json({ text: combined, pagesRead, images, success: true });
+    return res.json({ text: combined, pagesRead, images, title: pageTitle, success: true });
   } catch (e: any) {
     console.error('extract-url error:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'URL extraction failed' });

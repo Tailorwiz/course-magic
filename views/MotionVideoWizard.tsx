@@ -1,10 +1,13 @@
 /**
  * MotionVideoWizard — the Motion Video builder.
  *
- * A 4-step wizard: Source -> Scenes -> Style -> Render.
+ * A 5-step wizard: Source -> Script -> Scenes -> Style -> Render.
  *  - Source: bring in content 4 ways (write a script, AI-generate one, upload
- *    a document/PDF, or point at a URL) + focus instructions.
- *  - Scenes: the AI Scene Director turns the content into an editable scene list.
+ *    a document/PDF, or point at a URL) + focus instructions + length.
+ *  - Script: STAGE 1 — the AI reads all the content and writes the COMPLETE
+ *    narration script. The user reviews/edits it before any scenes exist.
+ *  - Scenes: STAGE 2 — the AI Scene Director segments the approved script and
+ *    fit-matches each beat to a template, producing an editable scene list.
  *  - Style: brand kit, narration voice, background music.
  *  - Render: server-side render on AWS Lambda, with live progress.
  */
@@ -60,6 +63,22 @@ const MUSIC = [
   { label: 'Corporate Success', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3' },
   { label: 'Deep Focus', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3' },
 ];
+
+/** A track returned by the music search (/api/motion/find-music). */
+interface MusicResult {
+  url: string;
+  title: string;
+  artist: string;
+  duration: number; // milliseconds
+  license: string;
+  source: string;
+}
+
+/** Format a millisecond duration as m:ss. */
+const fmtDur = (ms: number): string => {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
 
 // --- Scene model (mirrors motion/src/scenes.ts) -----------------------------
 
@@ -410,8 +429,19 @@ const SceneCard: React.FC<{
 
 // --- Main component ---------------------------------------------------------
 
-type WizardStep = 'source' | 'scenes' | 'style' | 'rendering' | 'done';
+type WizardStep = 'source' | 'script' | 'scenes' | 'style' | 'rendering' | 'done';
 type SourceMode = 'write' | 'ai' | 'document' | 'url';
+
+/** Brand name shown until the source content tells us the real one. */
+const DEFAULT_BRAND = 'Course Magic';
+
+/** Target video lengths. The scriptwriter sizes the narration to match. */
+const LENGTHS: { id: string; label: string; minutes?: number }[] = [
+  { id: 'auto', label: 'Auto — tight & punchy (~90-160s)' },
+  { id: 'short', label: 'Short — about 1 minute', minutes: 1 },
+  { id: 'standard', label: 'Standard — about 2 minutes', minutes: 2 },
+  { id: 'detailed', label: 'Detailed — about 3-4 minutes', minutes: 3.5 },
+];
 
 export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }) => {
   const [step, setStep] = useState<WizardStep>('source');
@@ -424,7 +454,13 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [docFile, setDocFile] = useState<File | null>(null);
   const [urlInput, setUrlInput] = useState('');
   const [focus, setFocus] = useState('');
+  const [videoLength, setVideoLength] = useState('auto');
   const [sourceBusy, setSourceBusy] = useState(false);
+
+  // Script (Stage 1 — the full narration script, reviewed before scenes exist)
+  const [fullScript, setFullScript] = useState('');
+  const [scriptBusy, setScriptBusy] = useState(false);
+  const [scriptProvider, setScriptProvider] = useState('');
 
   // Scenes
   const [scenes, setScenes] = useState<Scene[]>([]);
@@ -432,7 +468,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [siteImages, setSiteImages] = useState<string[]>([]);
 
   // Style — brand
-  const [brandName, setBrandName] = useState('Course Magic');
+  const [brandName, setBrandName] = useState(DEFAULT_BRAND);
   const [primary, setPrimary] = useState('#4f46e5');
   const [accent, setAccent] = useState('#ff5a1f');
   const [tone, setTone] = useState<'bold' | 'calm' | 'corporate'>('bold');
@@ -443,6 +479,14 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   const [voiceSpeed, setVoiceSpeed] = useState(1.0);
   const [musicUrl, setMusicUrl] = useState(MUSIC[1].url);
   const [musicMode, setMusicMode] = useState<'continuous' | 'introOutro'>('continuous');
+  // Tracks the user added themselves (uploaded or picked from search) — these
+  // get appended to the music dropdown.
+  const [uploadedMusic, setUploadedMusic] = useState<{ label: string; url: string }[]>([]);
+  const [musicBusy, setMusicBusy] = useState(false);
+  // Music search (Openverse audio).
+  const [musicQuery, setMusicQuery] = useState('');
+  const [musicResults, setMusicResults] = useState<MusicResult[]>([]);
+  const [musicSearching, setMusicSearching] = useState(false);
 
   // Render
   const [progress, setProgress] = useState(0);
@@ -473,25 +517,41 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
       reader.readAsDataURL(file);
     });
 
-  // --- Step 1 -> Step 2: resolve the source text, then run the Scene Director.
-  const buildScenes = async () => {
+  const targetMinutes = LENGTHS.find((l) => l.id === videoLength)?.minutes;
+
+  // --- Step 1 -> Step 2: resolve the raw source content, then run STAGE 1
+  // (the scriptwriter) to produce the full narration script for review.
+  const buildScript = async () => {
     setError('');
     setSourceBusy(true);
     try {
-      let sourceText = '';
+      let rawContent = '';
+      let fromTopic = false;
+
+      // Auto-fill the brand name from the source — but never clobber a name
+      // the user has already typed themselves.
+      let resolvedBrand = brandName;
+      const autofillBrand = (name?: string) => {
+        const n = (name || '').trim().slice(0, 60);
+        if (n && (brandName === DEFAULT_BRAND || !brandName.trim())) {
+          resolvedBrand = n;
+          setBrandName(n);
+        }
+      };
+
       if (sourceMode === 'write') {
-        sourceText = scriptText.trim();
-        if (sourceText.length < 20) throw new Error('Write a longer script (at least a few sentences).');
+        rawContent = scriptText.trim();
+        if (rawContent.length < 20) throw new Error('Write a longer script (at least a few sentences).');
+        // The user wrote the script themselves — use it directly, no rewrite.
+        setFullScript(rawContent);
+        setScriptProvider('you');
+        setSourceBusy(false);
+        setStep('script');
+        return;
       } else if (sourceMode === 'ai') {
         if (!aiTopic.trim()) throw new Error('Enter a topic for the AI to write about.');
-        const prompt = `Write a clear, engaging ~250-word explainer video script about: "${aiTopic.trim()}".${focus.trim() ? ` Focus notes: ${focus.trim()}.` : ''} Return just the script text.`;
-        const r = await apiFetch('/api/ai/generate-text', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt }),
-        });
-        const d = await readJson(r);
-        if (!r.ok || !d.text) throw new Error(d.error || 'AI script generation failed');
-        sourceText = d.text;
+        rawContent = aiTopic.trim();
+        fromTopic = true;
       } else if (sourceMode === 'document') {
         if (!docFile) throw new Error('Upload a document first.');
         const { data, mimeType } = await fileToBase64(docFile);
@@ -504,7 +564,8 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         });
         const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that document');
-        sourceText = d.text;
+        rawContent = d.text;
+        autofillBrand(docFile.name.replace(/\.[^.]+$/, ''));
       } else if (sourceMode === 'url') {
         if (!urlInput.trim()) throw new Error('Enter a website URL.');
         const r = await apiFetch('/api/ai/extract-url', {
@@ -513,28 +574,67 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         });
         const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that URL');
-        sourceText = d.text;
+        rawContent = d.text;
         if (Array.isArray(d.images)) setSiteImages(d.images);
+        autofillBrand(d.title);
       }
 
-      // Run the AI Scene Director.
+      // Stage 1 — the scriptwriter reads the content and writes the full script.
       setSourceBusy(false);
-      setScenesBusy(true);
-      setStep('scenes');
-      const sr = await apiFetch('/api/ai/generate-scenes', {
+      setScriptBusy(true);
+      setStep('script');
+      const sr = await apiFetch('/api/ai/generate-script', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceText, focusInstructions: focus.trim() || undefined, brandName }),
+        body: JSON.stringify({
+          sourceText: rawContent,
+          focusInstructions: focus.trim() || undefined,
+          brandName: resolvedBrand,
+          targetMinutes,
+          fromTopic,
+        }),
       });
       const sd = await readJson(sr);
-      if (!sr.ok || !Array.isArray(sd.scenes) || sd.scenes.length === 0) {
-        throw new Error(sd.error || 'The Scene Director could not build scenes — try different content.');
+      if (!sr.ok || !sd.script) {
+        throw new Error(sd.error || 'The scriptwriter could not write a script — try different content.');
       }
-      setScenes(sd.scenes);
+      setFullScript(sd.script);
+      setScriptProvider(sd.provider || '');
     } catch (e: any) {
       setError(e?.message || 'Something went wrong');
       setStep('source');
     } finally {
       setSourceBusy(false);
+      setScriptBusy(false);
+    }
+  };
+
+  // --- Step 2 -> Step 3: STAGE 2 — segment the approved script into scenes.
+  const buildScenes = async () => {
+    if (fullScript.trim().length < 20) {
+      setError('The script is too short — add more before generating scenes.');
+      return;
+    }
+    setError('');
+    setScenesBusy(true);
+    setStep('scenes');
+    try {
+      const sr = await apiFetch('/api/ai/generate-scenes', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          script: fullScript.trim(),
+          focusInstructions: focus.trim() || undefined,
+          brandName,
+        }),
+      });
+      const sd = await readJson(sr);
+      if (!sr.ok || !Array.isArray(sd.scenes) || sd.scenes.length === 0) {
+        throw new Error(sd.error || 'The Scene Director could not build scenes — try editing the script.');
+      }
+      setScenes(sd.scenes);
+    } catch (e: any) {
+      setError(e?.message || 'Something went wrong');
+      setStep('script');
+    } finally {
       setScenesBusy(false);
     }
   };
@@ -561,18 +661,77 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
     }
   };
 
-  const previewMusic = () => {
-    if (!musicUrl) return;
-    if (musicPreviewRef.current) {
-      musicPreviewRef.current.pause();
-      musicPreviewRef.current = null;
+  // Upload a music track of the user's own — stored in Supabase, so the Lambda
+  // renderer can fetch it reliably (unlike most hotlinked third-party tracks).
+  const handleMusicUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('audio/')) {
+      setError('Music must be an audio file (MP3, WAV, M4A…).');
       return;
     }
-    const a = new Audio(musicUrl);
+    setError('');
+    setMusicBusy(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const resp = await apiFetch('/api/motion/upload-asset', { method: 'POST', body: form });
+      const data = await readJson(resp);
+      if (!resp.ok || !data.url) throw new Error(data.error || 'Upload failed');
+      const label = file.name.replace(/\.[^.]+$/, '').slice(0, 50) || 'Uploaded track';
+      setUploadedMusic((prev) => [...prev, { label, url: data.url }]);
+      setMusicUrl(data.url);
+    } catch (err: any) {
+      setError(err?.message || 'Music upload failed');
+    } finally {
+      setMusicBusy(false);
+    }
+  };
+
+  // Preview a track. Pass a url to preview a specific one; clicking the track
+  // that's already playing stops it.
+  const previewMusic = (url?: string) => {
+    const src = url || musicUrl;
+    if (!src) return;
+    const abs = (() => { try { return new URL(src, window.location.href).href; } catch { return src; } })();
+    const cur = musicPreviewRef.current;
+    if (cur) {
+      cur.pause();
+      musicPreviewRef.current = null;
+      if (cur.src === abs) return;
+    }
+    const a = new Audio(src);
     a.volume = 0.5;
     a.play().catch(() => undefined);
     a.onended = () => { musicPreviewRef.current = null; };
     musicPreviewRef.current = a;
+  };
+
+  // Search Openverse audio for background music.
+  const searchMusic = async () => {
+    if (!musicQuery.trim()) return;
+    setError('');
+    setMusicSearching(true);
+    try {
+      const resp = await apiFetch('/api/motion/find-music', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: musicQuery.trim(), count: 24 }),
+      });
+      const data = await readJson(resp);
+      if (!resp.ok) throw new Error(data.error || 'Music search failed');
+      setMusicResults(data.tracks || []);
+    } catch (err: any) {
+      setError(err?.message || 'Music search failed');
+    } finally {
+      setMusicSearching(false);
+    }
+  };
+
+  // Add a searched track to the dropdown and select it.
+  const useTrack = (t: MusicResult) => {
+    const label = `${t.title}${t.artist ? ` — ${t.artist}` : ''}`.slice(0, 60);
+    setUploadedMusic((prev) => (prev.some((m) => m.url === t.url) ? prev : [...prev, { label, url: t.url }]));
+    setMusicUrl(t.url);
   };
 
   const startRender = async () => {
@@ -654,6 +813,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
 
   const steps: { id: WizardStep; label: string }[] = [
     { id: 'source', label: 'Source' },
+    { id: 'script', label: 'Script' },
     { id: 'scenes', label: 'Scenes' },
     { id: 'style', label: 'Style' },
   ];
@@ -732,18 +892,86 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
               onChange={(e) => setFocus(e.target.value)}
               placeholder="Tell the AI what to emphasize or skip — e.g. 'focus on pricing and benefits, skip the team bios'."
             />
+
+            {sourceMode !== 'write' && (
+              <div>
+                <label className="block text-sm font-bold text-slate-600 mb-1">Video length</label>
+                <select
+                  value={videoLength}
+                  onChange={(e) => setVideoLength(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2"
+                >
+                  {LENGTHS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+                </select>
+                <p className="text-xs text-slate-400 mt-1">
+                  The scriptwriter sizes the narration to this. You can still edit the script before scenes are built.
+                </p>
+              </div>
+            )}
           </section>
 
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={onCancel}>Cancel</Button>
-            <Button onClick={buildScenes} disabled={sourceBusy} icon={sourceBusy ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}>
-              {sourceBusy ? 'Reading content…' : 'Build my video'}
+            <Button onClick={buildScript} disabled={sourceBusy} icon={sourceBusy ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}>
+              {sourceBusy ? 'Reading content…' : sourceMode === 'write' ? 'Review my script' : 'Write the script'}
             </Button>
           </div>
         </div>
       )}
 
-      {/* STEP 2 — SCENES */}
+      {/* STEP 2 — SCRIPT (Stage 1: the full narration, reviewed before scenes) */}
+      {step === 'script' && (
+        <div className="space-y-5">
+          {scriptBusy ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-16 text-center">
+              <Loader2 size={40} className="animate-spin text-indigo-600 mx-auto mb-4" />
+              <p className="font-bold text-slate-700">Reading your content and writing the full script…</p>
+              <p className="text-sm text-slate-400 mt-1">The AI reads everything first, then writes the complete narration — before any scenes exist.</p>
+            </div>
+          ) : (
+            <>
+              <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-slate-700">Your video script</h3>
+                  {fullScript.trim() && (
+                    <span className="text-xs text-slate-400">
+                      {fullScript.trim().split(/\s+/).length} words · ~{Math.max(1, Math.round(fullScript.trim().split(/\s+/).length / 150))} min
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-slate-500">
+                  This is the complete narration — exactly what the voiceover will say. Read it,
+                  edit anything you like, and only then turn it into scenes. The scenes reuse
+                  this script word-for-word, so get it right here first.
+                </p>
+                <TextArea
+                  rows={16}
+                  value={fullScript}
+                  onChange={(e) => setFullScript(e.target.value)}
+                  placeholder="Your full narration script…"
+                />
+                {scriptProvider && scriptProvider !== 'you' && (
+                  <p className="text-xs text-slate-400">
+                    Drafted by {scriptProvider === 'openai' ? 'GPT-4o' : scriptProvider === 'gemini' ? 'Gemini' : scriptProvider}. Edit freely before continuing.
+                  </p>
+                )}
+              </section>
+
+              <div className="flex justify-between gap-3">
+                <Button variant="secondary" onClick={() => setStep('source')} icon={<ChevronLeft size={16} />}>Back</Button>
+                <div className="flex gap-3">
+                  {sourceMode !== 'write' && (
+                    <Button variant="secondary" onClick={buildScript} icon={<Wand2 size={14} />}>Rewrite script</Button>
+                  )}
+                  <Button onClick={buildScenes} icon={<ChevronRight size={16} />}>Generate scenes</Button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* STEP 3 — SCENES */}
       {step === 'scenes' && (
         <div className="space-y-5">
           {scenesBusy ? (
@@ -787,7 +1015,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
               </div>
 
               <div className="flex justify-between gap-3">
-                <Button variant="secondary" onClick={() => setStep('source')} icon={<ChevronLeft size={16} />}>Back</Button>
+                <Button variant="secondary" onClick={() => setStep('script')} icon={<ChevronLeft size={16} />}>Back to script</Button>
                 <Button onClick={() => setStep('style')} icon={<ChevronRight size={16} />}>Continue to Style</Button>
               </div>
             </>
@@ -795,7 +1023,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         </div>
       )}
 
-      {/* STEP 3 — STYLE */}
+      {/* STEP 4 — STYLE */}
       {step === 'style' && (
         <div className="space-y-5">
           <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
@@ -865,11 +1093,59 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                 <div className="flex gap-2">
                   <select value={musicUrl} onChange={(e) => setMusicUrl(e.target.value)} className="flex-1 border border-slate-300 rounded-lg p-2">
                     {MUSIC.map((m) => <option key={m.label} value={m.url}>{m.label}</option>)}
+                    {uploadedMusic.length > 0 && (
+                      <optgroup label="Added tracks">
+                        {uploadedMusic.map((m) => <option key={m.url} value={m.url}>{m.label}</option>)}
+                      </optgroup>
+                    )}
                   </select>
                   {musicUrl && (
-                    <button onClick={previewMusic} className="px-3 border border-slate-300 rounded-lg text-slate-500 hover:bg-slate-50" title="Preview"><Play size={16} /></button>
+                    <button onClick={() => previewMusic()} className="px-3 border border-slate-300 rounded-lg text-slate-500 hover:bg-slate-50" title="Preview"><Play size={16} /></button>
                   )}
                 </div>
+                <label className="mt-2 cursor-pointer inline-flex items-center gap-2 text-xs font-bold text-indigo-600 hover:bg-indigo-50 px-2 py-1.5 rounded">
+                  {musicBusy ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />}
+                  {musicBusy ? 'Uploading…' : 'Upload your own track (MP3, WAV…)'}
+                  <input type="file" accept="audio/*" className="hidden" onChange={handleMusicUpload} disabled={musicBusy} />
+                </label>
+
+                {/* Search an open music library */}
+                <div className="flex gap-2 mt-2">
+                  <input
+                    value={musicQuery}
+                    onChange={(e) => setMusicQuery(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') searchMusic(); }}
+                    placeholder="Search music — e.g. 'upbeat corporate', 'cinematic'"
+                    className="flex-1 border border-slate-300 rounded-lg p-2 text-sm"
+                  />
+                  <button onClick={searchMusic} disabled={musicSearching} className="px-3 bg-indigo-600 text-white rounded-lg text-sm font-bold disabled:opacity-50">
+                    {musicSearching ? '…' : 'Search'}
+                  </button>
+                </div>
+                {musicResults.length > 0 && (
+                  <div className="mt-2 border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-64 overflow-y-auto">
+                    {musicResults.map((t) => (
+                      <div key={t.url} className="flex items-center gap-2 p-2 text-sm">
+                        <button onClick={() => previewMusic(t.url)} className="text-slate-400 hover:text-indigo-600 shrink-0" title="Preview"><Play size={14} /></button>
+                        <div className="flex-1 min-w-0">
+                          <div className="truncate font-medium text-slate-700">{t.title}</div>
+                          <div className="truncate text-xs text-slate-400">
+                            {t.artist || 'Unknown'} · {t.license || 'see source'}{t.duration ? ` · ${fmtDur(t.duration)}` : ''}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => useTrack(t)}
+                          className={`shrink-0 text-xs font-bold px-2 py-1 rounded ${musicUrl === t.url ? 'bg-green-100 text-green-700' : 'text-indigo-600 border border-indigo-200 hover:bg-indigo-50'}`}
+                        >
+                          {musicUrl === t.url ? 'Selected' : 'Use'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Search results come from open music libraries — licenses vary and are shown per track.
+                </p>
               </div>
             </div>
             {musicUrl && (

@@ -1,15 +1,26 @@
 /**
  * server/sceneDirector.ts — the AI Scene Director.
  *
- * Turns source content (a script, an extracted document, or a webpage's text)
- * into a motion-video scene list: it picks a template per beat, writes the
- * on-screen copy and the spoken `narration`.
+ * This is a TWO-STAGE pipeline. Source content never becomes scenes directly:
+ *
+ *  Stage 1 — SCRIPTWRITER (buildScriptPrompt):
+ *    Reads ALL of the source content (a document, a crawled website, or a
+ *    topic brief) and writes the COMPLETE spoken narration script — start to
+ *    finish — before any scene exists. The user reviews/edits this script.
+ *
+ *  Stage 2 — DIRECTOR (buildDirectorPrompt):
+ *    Takes the FINISHED, approved script and segments it into ordered beats.
+ *    Each beat's narration is a verbatim slice of the script. For each beat it
+ *    picks the scene template that genuinely FITS that content (fit over
+ *    variety — repeating a template is fine) and writes the short on-screen
+ *    copy.
  *
  * Exports:
- *  - buildDirectorPrompt() — the LLM prompt (template catalog + rules)
+ *  - buildScriptPrompt()   — Stage 1 LLM prompt (write the full script)
+ *  - buildDirectorPrompt() — Stage 2 LLM prompt (segment script -> scenes)
  *  - sanitizeScenes()      — JS-level validation/repair of the model's JSON
  *
- * The endpoint in server/index.ts runs the prompt through the standard
+ * The endpoints in server/index.ts run each prompt through the standard
  * Gemini -> OpenAI fallback. Full Zod validation happens later at Lambda
  * render time (the composition's schema); this sanitizer just guarantees the
  * scenes are structurally sane so the render does not fail.
@@ -32,7 +43,7 @@ const DIRECTOR_TYPES = [
 
 /** Human-readable catalog given to the model. */
 const TEMPLATE_CATALOG = `
-SCENE TEMPLATES (pick the one that best fits each beat):
+SCENE TEMPLATES (pick the one that best FITS each beat):
 
 1. kineticTitle — a big animated headline. Best for the opening hook and
    section breaks. JSON: { "type":"kineticTitle", "lines":[{"text":"first line"},{"text":"second line","accent":"a word"}], "narration":"spoken line" }
@@ -78,36 +89,158 @@ SCENE TEMPLATES (pick the one that best fits each beat):
     "url":"optional", "narration":"..." }
 `.trim();
 
-/** Build the LLM prompt for the Scene Director. */
-export function buildDirectorPrompt(
+export interface ScriptPromptOptions {
+  /** Approximate spoken length to target, in minutes. Omit for a tight default. */
+  targetMinutes?: number;
+  /** True when the "source" is only a topic brief (the AI-writes-it mode),
+   *  rather than real source content the script must stay faithful to. */
+  fromTopic?: boolean;
+}
+
+/**
+ * Stage 1 — the SCRIPTWRITER prompt.
+ *
+ * Tells the model to read the whole source and write the complete spoken
+ * narration script. No scenes, no templates, no visuals at this stage.
+ */
+export function buildScriptPrompt(
   sourceText: string,
+  focusInstructions: string | undefined,
+  brandName: string | undefined,
+  options: ScriptPromptOptions = {},
+): string {
+  const { targetMinutes, fromTopic } = options;
+
+  const focus = focusInstructions?.trim()
+    ? `\nFOCUS INSTRUCTIONS FROM THE USER (these OVERRIDE the default — obey them exactly; they say what to emphasize, skip, or how to angle the video):\n"${focusInstructions.trim()}"\n`
+    : '\n(No focus instructions — cover the source content as a whole, fairly and completely.)\n';
+  const brand = brandName?.trim() ? ` for the brand "${brandName.trim()}"` : '';
+
+  // Narration runs ~150 spoken words per minute.
+  let lengthGuidance: string;
+  if (targetMinutes && targetMinutes > 0) {
+    const words = Math.round(targetMinutes * 150);
+    lengthGuidance = `TARGET LENGTH: about ${targetMinutes} minute(s) of spoken narration — roughly ${words} words. Write enough real, substantive content to fill that honestly; do NOT pad with filler or repeat yourself just to hit the count.`;
+  } else {
+    lengthGuidance = `TARGET LENGTH: a tight, punchy explainer — about 90 to 160 seconds of narration (roughly 220-400 words). Every sentence must earn its place.`;
+  }
+
+  // Faithfulness rules differ for "AI writes it from a topic" vs real source.
+  const fidelity = fromTopic
+    ? `The SOURCE below is a TOPIC BRIEF, not finished content. Write an accurate,
+well-informed explainer about it using reliable general knowledge. Stay
+truthful — do NOT invent fake statistics, fake quotes, fake testimonials, or
+specific claims you cannot stand behind.`
+    : `Be genuinely ACCURATE to the source. Use its real facts, real product names,
+real numbers, real details. NEVER invent statistics, features, testimonials, or
+claims that the source content does not support. If the source is thin or
+vague, keep the script proportionally short — do NOT fabricate detail to fill
+space.`;
+
+  return `You are an expert explainer-video scriptwriter${brand}.
+
+YOUR JOB IN THIS STEP: read the SOURCE CONTENT below COMPLETELY and write the
+FULL spoken narration script for an explainer video. This is step 1 of 2 — you
+are ONLY writing the script now. Do NOT think about scenes, visuals, layouts,
+or templates yet. Just write what the voiceover will actually say, start to
+finish.
+
+HOW TO WORK:
+1. Read ALL of the source content carefully. Understand what it actually says —
+   the product or topic, who it is for, the real problems it solves, and the
+   concrete facts, numbers, names, and specific details.
+2. ${fidelity}
+3. Structure it naturally: a strong hook that names the problem or the promise,
+   a clear middle that explains the substance, and a closing call to action.
+4. Write in a confident, clear, spoken voice — short sentences, plain words,
+   the way a great narrator actually talks. No headings, no bullet points, no
+   stage directions, no "[Scene 1]" labels, no markdown. Just the flowing
+   spoken words, in paragraphs.
+5. ${lengthGuidance}
+${focus}
+Return ONLY the script text itself — plain text, no JSON, no markdown, no
+preamble like "Here is the script". Just the words the narrator will speak.
+
+SOURCE CONTENT:
+${sourceText.slice(0, 60000)}`;
+}
+
+/**
+ * Stage 2 — the DIRECTOR prompt.
+ *
+ * Takes a FINISHED, approved script and turns it into a scene list: segment
+ * into beats, fit-match each beat to a template, write the on-screen copy.
+ */
+export function buildDirectorPrompt(
+  script: string,
   focusInstructions: string | undefined,
   brandName: string | undefined,
 ): string {
   const focus = focusInstructions?.trim()
-    ? `\nFOCUS INSTRUCTIONS FROM THE USER (obey these — they say what to emphasize or skip):\n"${focusInstructions.trim()}"\n`
+    ? `\nFOCUS INSTRUCTIONS FROM THE USER (keep these in mind when choosing emphasis and on-screen wording):\n"${focusInstructions.trim()}"\n`
     : '';
   const brand = brandName?.trim() ? ` for "${brandName.trim()}"` : '';
-  return `You are a motion-graphics video director${brand}. Turn the SOURCE CONTENT below
-into a punchy animated explainer video — a list of 5 to 9 scenes.
+
+  return `You are a motion-graphics video director${brand}. The SCRIPT below is
+ALREADY WRITTEN and APPROVED. This is step 2 of 2: turn the finished script into
+an animated scene list. You must NOT rewrite, summarize, shorten, lengthen, or
+add to the script — your job is to stage it, not to write it.
 
 ${TEMPLATE_CATALOG}
 
-RULES:
-- Open with a kineticTitle hook. Close with a ctaEndCard.
-- Vary the templates — do not use the same type twice in a row.
-- Every scene MUST have a "narration" field: one or two natural spoken
-  sentences for that scene. The narration is what the voiceover says; the
-  on-screen copy fields are short and punchy, NOT the same as the narration.
-- Keep all on-screen text short. Long sentences belong only in narration.
-- Use statCountUp only when the source has a real number worth featuring.
+YOUR JOB:
+1. SEGMENT the script into ordered beats. A beat is a short contiguous slice of
+   the script — usually one to three sentences — that belongs together as a
+   single on-screen moment.
+2. CRITICAL: every scene's "narration" field MUST be the EXACT, VERBATIM text of
+   its beat, copied straight from the script. Concatenating every scene's
+   "narration" in order, with a single space between each, MUST reproduce the
+   ENTIRE script word-for-word. Do not drop, reorder, reword, paraphrase, or add
+   a single sentence. The narration IS the script.
+3. For EACH beat, choose the ONE scene template that genuinely FITS what that
+   beat says — the template whose layout best carries that specific content.
+4. Write the on-screen copy for the chosen template: short, punchy text fields
+   derived from the beat. On-screen text is NOT the narration repeated — it is
+   the few key words or phrases that should appear on screen while that
+   narration is spoken.
+
+CHOOSING TEMPLATES — FIT OVER VARIETY (this is important):
+- Pick each template by FIT, never for the sake of variety. If five beats in a
+  row are all best served by the same template, use that template five times in
+  a row. That is correct and expected.
+- Equally, never force the same template everywhere — use whatever each beat
+  genuinely needs.
+- Do NOT bend a beat to fit a template. Only use:
+  - statCountUp when the beat genuinely centers on a real number from the script.
+  - flowchart for an actual problem/consequence chain.
+  - timeline for actual events ordered in time.
+  - beforeAfter for a real contrast between two states.
+  - quoteCard ONLY for an actual word-for-word quotation from a named or
+    implied speaker — never for a normal narration sentence.
+- If a beat is a single short sentence or a connective line that fits no
+  specialized template, use kineticTitle (a punchy on-screen line) or
+  bulletBuild. Never force such a beat into quoteCard, statCountUp, flowchart,
+  timeline, or beforeAfter.
+
+REQUIRED STRUCTURE:
+- The FIRST scene MUST be a kineticTitle — the opening hook.
+- The LAST scene MUST be a ctaEndCard. Find the closing call-to-action in the
+  script (the part telling the viewer what to do next or where to go) and make
+  that ONE ctaEndCard scene. Group the entire closing call-to-action into it —
+  do not split the ending across kineticTitle/quoteCard/bulletBuild scenes. Its
+  "narration" is that closing slice of the script; its "headline", "cta", and
+  "url" fields are drawn from that same closing content.
+- Everything between the first and last scene: fit each beat freely.
+
+OTHER RULES:
+- Keep all on-screen text short. The long-form wording lives only in narration.
 - Optionally give each scene a "transition" — one of: fade, slide, wipe, flip,
-  clockWipe — and vary them across the video for visual interest.
+  clockWipe — for visual flow.
 - Return ONLY JSON, no prose, in exactly this shape:
   { "scenes": [ { ...scene... }, ... ] }
 ${focus}
-SOURCE CONTENT:
-${sourceText.slice(0, 40000)}`;
+THE APPROVED SCRIPT (segment this — do NOT change its words):
+${script.slice(0, 40000)}`;
 }
 
 type AnyScene = Record<string, any>;
