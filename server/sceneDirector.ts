@@ -105,7 +105,7 @@ RULES:
   { "scenes": [ { ...scene... }, ... ] }
 ${focus}
 SOURCE CONTENT:
-${sourceText.slice(0, 14000)}`;
+${sourceText.slice(0, 40000)}`;
 }
 
 type AnyScene = Record<string, any>;

@@ -3702,14 +3702,14 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
     }
   }
 
-  // OpenAI fallback.
+  // OpenAI fallback — gpt-4o (the strong model) for thorough content analysis.
   if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
     try {
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o',
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
-        max_completion_tokens: 4096,
+        max_completion_tokens: 6000,
       });
       const scenes = parseScenes(response.choices[0]?.message?.content || '{}');
       if (scenes.length === 0) throw new Error('No usable scenes from OpenAI');
@@ -3728,8 +3728,26 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
 });
 
 // ============ MOTION VIDEO — URL CONTENT EXTRACTION ============
-// Fetches a webpage and strips it to readable text, for use as a content
-// source by the AI Scene Director.
+// Reads a website for the AI Scene Director. Uses Jina AI Reader
+// (https://r.jina.ai) — free, no key — which RENDERS JavaScript and returns
+// clean markdown, so modern JS-built sites are read properly (a raw fetch
+// would only see an empty shell). Crawls the entry page plus a few key pages
+// (about, pricing, product…) so "review my website" covers the whole business.
+
+const URL_EXTRACT_MAX_CHARS = 45000;
+const KEY_PAGE_KEYWORDS =
+  /(about|pricing|price|plans?|product|features?|services?|solutions?|how-?it-?works|what-we-do|benefits?|overview)/i;
+
+/** Fetch one page's clean, JS-rendered content via Jina AI Reader. */
+async function fetchViaJina(pageUrl: string): Promise<string> {
+  const r = await fetch(`https://r.jina.ai/${pageUrl}`, {
+    headers: { 'User-Agent': 'CourseMagic', 'X-Return-Format': 'markdown' },
+    signal: AbortSignal.timeout(35000),
+  });
+  if (!r.ok) throw new Error(`Reader returned HTTP ${r.status}`);
+  return (await r.text()).trim();
+}
+
 app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
   try {
     const { url } = req.body;
@@ -3758,35 +3776,59 @@ app.post("/api/ai/extract-url", requireRole("CREATOR"), async (req, res) => {
       return res.status(400).json({ error: "That URL is not allowed" });
     }
 
-    const resp = await fetch(parsed.toString(), {
-      headers: { 'User-Agent': 'Mozilla/5.0 (CourseMagic content extractor)' },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!resp.ok) {
-      return res.status(502).json({ error: `Could not fetch the page (HTTP ${resp.status})` });
-    }
-    const html = await resp.text();
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-      .replace(/<!--[\s\S]*?-->/g, ' ')
-      .replace(/<(nav|footer|header|aside)[\s\S]*?<\/\1>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 14000);
+    const entryUrl = parsed.toString();
 
-    if (text.length < 40) {
-      return res.status(422).json({ error: "Couldn't extract readable text from that page" });
+    // 1. Read the entry page (JS-rendered).
+    let entryContent: string;
+    try {
+      entryContent = await fetchViaJina(entryUrl);
+    } catch (e: any) {
+      return res.status(502).json({
+        error: `Could not read that page: ${String(e?.message || e).slice(0, 120)}`,
+      });
     }
-    return res.json({ text, success: true });
+
+    // 2. Discover up to 4 same-domain key pages from the entry page's links.
+    const linkRe = /\]\((https?:\/\/[^)\s]+)\)/g;
+    const seen = new Set<string>([entryUrl.replace(/\/$/, '')]);
+    const keyPages: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(entryContent)) !== null && keyPages.length < 4) {
+      try {
+        const lu = new URL(m[1]);
+        if (lu.hostname.toLowerCase() !== host) continue;
+        const norm = `${lu.origin}${lu.pathname}`.replace(/\/$/, '');
+        if (seen.has(norm) || !KEY_PAGE_KEYWORDS.test(lu.pathname)) continue;
+        seen.add(norm);
+        keyPages.push(norm);
+      } catch {
+        /* skip malformed links */
+      }
+    }
+
+    // 3. Read the key pages in parallel; skip any that fail.
+    const extra = await Promise.all(
+      keyPages.map(async (p) => {
+        try {
+          return { url: p, content: await fetchViaJina(p) };
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    // 4. Combine into one labelled document.
+    const pagesRead = [entryUrl, ...extra.filter(Boolean).map((x) => x!.url)];
+    let combined = `=== PAGE: ${entryUrl} ===\n${entryContent}`;
+    for (const x of extra) {
+      if (x) combined += `\n\n=== PAGE: ${x.url} ===\n${x.content}`;
+    }
+    combined = combined.slice(0, URL_EXTRACT_MAX_CHARS).trim();
+
+    if (combined.replace(/=== PAGE:[^\n]*\n/g, '').trim().length < 60) {
+      return res.status(422).json({ error: "Couldn't extract readable content from that site" });
+    }
+    return res.json({ text: combined, pagesRead, success: true });
   } catch (e: any) {
     console.error('extract-url error:', e?.message || e);
     return res.status(500).json({ error: e?.message || 'URL extraction failed' });
@@ -3886,7 +3928,7 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
       }
 
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o',
         messages: [{ role: 'user', content: augmentedPrompt }],
         response_format: jsonMode ? { type: 'json_object' } : undefined,
         max_completion_tokens: maxTokens || 4096,
