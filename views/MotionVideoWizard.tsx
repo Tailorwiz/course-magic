@@ -143,14 +143,38 @@ const SceneCard: React.FC<{
   scene: Scene;
   index: number;
   total: number;
+  siteImages?: string[];
   onChange: (patch: Partial<Scene>) => void;
   onMove: (dir: -1 | 1) => void;
   onDelete: () => void;
-}> = ({ scene, index, total, onChange, onMove, onDelete }) => {
+}> = ({ scene, index, total, siteImages, onChange, onMove, onDelete }) => {
   const set = (patch: any) => onChange(patch);
   const [mediaBusy, setMediaBusy] = useState(false);
   const [mediaErr, setMediaErr] = useState('');
   const [captureUrl, setCaptureUrl] = useState('');
+  const [imgQuery, setImgQuery] = useState('');
+  const [imgResults, setImgResults] = useState<{ url: string; thumb: string; source: string }[]>([]);
+  const [imgSearching, setImgSearching] = useState(false);
+
+  // Search the web for an image to use in this scene.
+  const searchImages = async () => {
+    if (!imgQuery.trim()) return;
+    setMediaErr('');
+    setImgSearching(true);
+    try {
+      const resp = await apiFetch('/api/motion/find-image', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: imgQuery.trim(), count: 12 }),
+      });
+      const data = await readJson(resp);
+      if (!resp.ok) throw new Error(data.error || 'Image search failed');
+      setImgResults(data.images || []);
+    } catch (err: any) {
+      setMediaErr(err?.message || 'Image search failed');
+    } finally {
+      setImgSearching(false);
+    }
+  };
 
   // Upload a product screenshot / screen recording for a media scene.
   const onMediaFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -303,7 +327,7 @@ const SceneCard: React.FC<{
               <button onClick={() => set({ mediaUrl: '' })} className="text-slate-400 hover:text-red-500"><Trash2 size={16} /></button>
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-3">
               <label className="cursor-pointer border-2 border-dashed border-slate-300 rounded-lg px-3 py-3 flex items-center justify-center gap-2 text-sm text-slate-500 hover:bg-slate-50">
                 {mediaBusy ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
                 {mediaBusy ? 'Working…' : 'Upload screenshot or screen recording'}
@@ -318,6 +342,47 @@ const SceneCard: React.FC<{
                 />
                 <button onClick={onCapture} disabled={mediaBusy} className="px-3 bg-slate-800 text-white rounded-lg text-sm font-bold disabled:opacity-50">Capture</button>
               </div>
+              <div className="flex gap-2">
+                <input
+                  value={imgQuery}
+                  onChange={(e) => setImgQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') searchImages(); }}
+                  placeholder="…or search the web for an image"
+                  className="flex-1 border border-slate-300 rounded-lg p-2 text-sm"
+                />
+                <button onClick={searchImages} disabled={imgSearching} className="px-3 bg-indigo-600 text-white rounded-lg text-sm font-bold disabled:opacity-50">
+                  {imgSearching ? '…' : 'Search'}
+                </button>
+              </div>
+              {imgResults.length > 0 && (
+                <div className="grid grid-cols-4 gap-2">
+                  {imgResults.map((r, i) => (
+                    <button
+                      key={i}
+                      onClick={() => set({ mediaUrl: r.url, mediaType: 'image' })}
+                      className="aspect-video rounded overflow-hidden border border-slate-200 hover:ring-2 hover:ring-indigo-500"
+                    >
+                      <img src={r.thumb} className="w-full h-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              )}
+              {siteImages && siteImages.length > 0 && (
+                <div>
+                  <div className="text-xs font-bold text-slate-500 mb-1">From your source website</div>
+                  <div className="grid grid-cols-4 gap-2">
+                    {siteImages.map((u, i) => (
+                      <button
+                        key={i}
+                        onClick={() => set({ mediaUrl: u, mediaType: 'image' })}
+                        className="aspect-video rounded overflow-hidden border border-slate-200 hover:ring-2 hover:ring-indigo-500"
+                      >
+                        <img src={u} className="w-full h-full object-cover" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
           {mediaErr && <div className="text-xs text-red-600">{mediaErr}</div>}
@@ -364,6 +429,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
   // Scenes
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [scenesBusy, setScenesBusy] = useState(false);
+  const [siteImages, setSiteImages] = useState<string[]>([]);
 
   // Style — brand
   const [brandName, setBrandName] = useState('Course Magic');
@@ -448,6 +514,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
         const d = await readJson(r);
         if (!r.ok || !d.text) throw new Error(d.error || 'Could not read that URL');
         sourceText = d.text;
+        if (Array.isArray(d.images)) setSiteImages(d.images);
       }
 
       // Run the AI Scene Director.
@@ -697,6 +764,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                     scene={scene}
                     index={i}
                     total={scenes.length}
+                    siteImages={siteImages}
                     onChange={(patch) => updateScene(i, patch)}
                     onMove={(dir) => moveScene(i, dir)}
                     onDelete={() => setScenes((prev) => prev.filter((_, idx) => idx !== i))}
