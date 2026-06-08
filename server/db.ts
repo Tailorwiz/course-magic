@@ -15,7 +15,11 @@ console.log(`Database: Using Supabase database`);
 
 let queryClient = postgres(databaseUrl, {
   max: 10,
-  idle_timeout: 300,       // keep connections warm 5 min so requests don't pay reconnect cost
+  // Supabase's pgbouncer kills idle pooler connections aggressively. If the
+  // client holds an idle conn longer than that, the NEXT query on that conn
+  // fails on a dead socket — the cause of "sometimes loads, sometimes doesn't"
+  // intermittency. Closing client-side after 20s keeps the pool fresh.
+  idle_timeout: 20,
   connect_timeout: 30,
   max_lifetime: 60 * 30,   // recycle connections every 30 min
   prepare: false,          // pgbouncer transaction-mode doesn't support prepared statements
@@ -48,7 +52,7 @@ export async function reconnectDb() {
   
   queryClient = postgres(dbUrl, {
     max: 10,
-    idle_timeout: 300,
+    idle_timeout: 20,        // see comment above — survives Supabase pgbouncer's aggressive idle-kill
     connect_timeout: 30,
     max_lifetime: 60 * 30,
     prepare: false,
