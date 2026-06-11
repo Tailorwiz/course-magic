@@ -27,7 +27,7 @@ import { safeExportCourse, stripHeavyAssets, exportCourseAsZip, exportAllDataAsZ
 import { Input, TextArea } from './components/Input';
 import { Button } from './components/Button';
 import { GoogleGenAI } from "@google/genai";
-import { api, apiFetch, clearToken, getToken } from './api';
+import { api, apiFetch, clearToken, getToken, setToken } from './api';
 
 const formatDuration = (totalSeconds: number): string => {
   if (!totalSeconds || totalSeconds <= 0) return '';
@@ -909,11 +909,31 @@ export const App = () => {
                       tickets={tickets}
                       onAddStudent={async (u) => {
                           try {
-                              await api.auth.register({
+                              // api.auth.register sets the auth token to the new student's,
+                              // which would log the admin out. Save and restore the admin's
+                              // token around the call so the admin session survives.
+                              const adminToken = getToken();
+                              const newUser = await api.auth.register({
                                   ...u,
                                   password: u.password || 'password'
                               });
-                              setStudents(prev => [...prev, u]);
+                              if (adminToken) setToken(adminToken);
+                              if (!newUser) throw new Error('Registration returned no user');
+                              // The register endpoint hardcodes assignedCourseIds to []
+                              // (public-signup safety). If the admin picked courses, assign
+                              // them now with a follow-up update so they take on the first try.
+                              let finalUser = { ...u, id: newUser.id } as User;
+                              if (u.assignedCourseIds && u.assignedCourseIds.length > 0) {
+                                  try {
+                                      const updated = await api.users.update(newUser.id, {
+                                          assignedCourseIds: u.assignedCourseIds,
+                                      });
+                                      if (updated) finalUser = updated;
+                                  } catch (e) {
+                                      console.warn('Created student but failed to assign courses:', e);
+                                  }
+                              }
+                              setStudents(prev => [...prev, finalUser]);
                           } catch (e) {
                               console.error('Failed to create student:', u.email, e);
                               alert('Failed to create student. Email may already exist.');
@@ -936,17 +956,37 @@ export const App = () => {
                           }
                       }}
                       onImportStudents={async (newUsers) => {
+                          // Each register() call overwrites the auth token. Save the admin's
+                          // token once and restore it after the whole batch.
+                          const adminToken = getToken();
+                          const imported: User[] = [];
                           for (const user of newUsers) {
                               try {
-                                  await api.auth.register({
+                                  const created = await api.auth.register({
                                       ...user,
                                       password: user.password || 'password'
                                   });
+                                  if (!created) continue;
+                                  let finalUser = { ...user, id: created.id } as User;
+                                  // register hardcodes assignedCourseIds: [] — assign them now.
+                                  if (user.assignedCourseIds && user.assignedCourseIds.length > 0) {
+                                      try {
+                                          if (adminToken) setToken(adminToken);
+                                          const updated = await api.users.update(created.id, {
+                                              assignedCourseIds: user.assignedCourseIds,
+                                          });
+                                          if (updated) finalUser = updated;
+                                      } catch (e) {
+                                          console.warn('Imported but could not assign courses:', user.email, e);
+                                      }
+                                  }
+                                  imported.push(finalUser);
                               } catch (e) {
                                   console.error('Failed to save user:', user.email, e);
                               }
                           }
-                          setStudents(prev => [...prev, ...newUsers]);
+                          if (adminToken) setToken(adminToken);
+                          setStudents(prev => [...prev, ...imported]);
                       }}
                       onImportProgress={async (importedProgress) => {
                           for (const [userId, courseProgress] of Object.entries(importedProgress)) {
