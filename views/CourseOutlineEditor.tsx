@@ -7,19 +7,7 @@ import {
     Edit3, Check, FolderPlus, Plus, Image as ImageIcon,
     Sparkles, Loader2, GripVertical, Upload, Video
 } from 'lucide-react';
-import { GoogleGenAI } from '@google/genai';
 import { api } from '../api';
-
-const getGeminiApiKey = (): string => {
-    if (typeof window !== 'undefined' && (window as any).GEMINI_API_KEY) {
-        return (window as any).GEMINI_API_KEY;
-    }
-    try {
-        const stored = localStorage.getItem('geminiApiKey');
-        if (stored) return stored;
-    } catch (e) {}
-    return '';
-};
 
 interface CourseOutlineEditorProps {
     course: Course;
@@ -94,38 +82,18 @@ export const CourseOutlineEditor: React.FC<CourseOutlineEditorProps> = ({
             return;
         }
         
-        const apiKey = getGeminiApiKey();
-        if (!apiKey) {
-            alert('Gemini API key not configured. Please add it in Settings.');
-            return;
-        }
-        
         setIsGeneratingCover(true);
         try {
-            const ai = new GoogleGenAI({ apiKey });
             const prompt = `Create a professional, modern course cover image for a course titled "${course.title}". ${coverInstructions || 'Use a clean, professional design with relevant imagery. Make it visually appealing and suitable for an online learning platform.'}`;
-            
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.0-flash-exp',
-                contents: prompt,
-                config: {
-                    responseModalities: ['IMAGE', 'TEXT'],
-                }
-            });
-            
-            if (response.candidates?.[0]?.content?.parts) {
-                for (const part of response.candidates[0].content.parts) {
-                    if (part.inlineData?.mimeType?.startsWith('image/')) {
-                        const base64 = part.inlineData.data;
-                        const dataUrl = `data:${part.inlineData.mimeType};base64,${base64}`;
-                        setCourse(prev => prev ? { ...prev, ecoverUrl: dataUrl } : prev);
-                        break;
-                    }
-                }
+
+            // Server-side image generation (GPT Image 2)
+            const result = await api.ai.generateImage(prompt, '3:4');
+            if (result.success && result.imageData) {
+                setCourse(prev => prev ? { ...prev, ecoverUrl: `data:image/png;base64,${result.imageData}` } : prev);
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error('Failed to generate cover:', error);
-            alert('Failed to generate cover image. Please try again.');
+            alert(`Failed to generate cover image: ${error?.message || 'unknown error'}`);
         } finally {
             setIsGeneratingCover(false);
         }

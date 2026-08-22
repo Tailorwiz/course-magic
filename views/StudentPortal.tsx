@@ -4,7 +4,6 @@ import { Course, Lesson, Module, VisualAsset, CaptionStyle, CaptionPosition, Cap
 import { Button } from '../components/Button';
 import { ChevronLeft, ChevronRight, PlayCircle, PauseCircle, CheckCircle2, Award, Volume2, Maximize, Minimize, SkipBack, SkipForward, ArrowLeft, Menu, X, FileText, Download, Loader2, Link as LinkIcon, BookOpen, ChevronDown, ChevronUp, Image as ImageIcon, Circle, Play, Clock, Layout, MessageCircle, Send, Sparkles, Lightbulb, CheckSquare, AlertCircle } from 'lucide-react';
 import { pcmToWav, renderVideoFromLesson, downloadBlob } from '../utils';
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { api, apiFetch, getToken } from '../api';
 
 interface WordTiming {

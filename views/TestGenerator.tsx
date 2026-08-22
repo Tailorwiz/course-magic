@@ -2,10 +2,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Button } from '../components/Button';
 import { TextArea } from '../components/Input';
-import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
 import { Loader2, PlayCircle, PauseCircle, Film, Timer, Zap, Gauge, Volume2, Music, Subtitles, AlignCenter } from 'lucide-react';
 import { VisualAsset, VoiceOption, CaptionStyle, CaptionPosition, CaptionSize, VisualMode } from '../types';
 import { pcmToWav, createSolidColorImage } from '../utils';
+import { api, apiFetch } from '../api';
 
 // Helper for Rate Limiting
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -138,14 +138,13 @@ export const TestGenerator = () => {
         if (isPreviewingVoice) return;
         setIsPreviewingVoice(true);
         try {
-            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-            const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-              model: "gemini-2.5-flash-preview-tts",
-              contents: [{ parts: [{ text: `Hello! I am ${voice}.` }] }],
-              config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: getVoiceModel(voice) } } } },
-           }));
-           if (response.candidates?.[0]?.content?.parts?.[0]?.inlineData) {
-               const binaryString = window.atob(response.candidates[0].content.parts[0].inlineData.data);
+            const res = await apiFetch('/api/tts/gemini', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: `Hello! I am ${voice}.`, voiceId: voice }),
+            });
+            const data = await res.json();
+            if (res.ok && data.audioData) {
+               const binaryString = window.atob(data.audioData);
                const bytes = new Uint8Array(binaryString.length);
                for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
                const blob = pcmToWav(bytes, 24000, 1);
@@ -199,15 +198,9 @@ export const TestGenerator = () => {
         setIsGenerating(true); setLogs([]); setGeneratedScript(''); setGeneratedVisuals([]); setWordTimings([]); setAudioUrl(null); setIsPlaying(false); setCurrentTime(0); setActiveVisual(null); setPreviousVisual(null);
 
         try {
-            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-            
             addLog("Step 1/4: Writing script...");
-            const scriptResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: { parts: [{ text: `Rewrite into conversational video script (approx 1 min). Input:\n${inputContent}` }] },
-                config: { thinkingConfig: { thinkingBudget: 2048 } }
-            }));
-            const script = scriptResponse.text || "Script generation failed.";
+            const scriptResp = await api.ai.generateText(`Rewrite into conversational video script (approx 1 min). Input:\n${inputContent}`, false, 4000);
+            const script = scriptResp.text || "Script generation failed.";
             setGeneratedScript(script);
 
             let pacingPrompt = "Break script into distinct visual scenes.";
@@ -217,24 +210,26 @@ export const TestGenerator = () => {
             addLog("Step 2/4: Designing storyboard...");
             let scenes: any[] = [];
             try {
-                const storyboardResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-                    model: 'gemini-2.5-flash',
-                    contents: { parts: [{ text: `${pacingPrompt} (JSON). Script: ${script}` }] },
-                    config: { thinkingConfig: { thinkingBudget: 2048 }, responseMimeType: "application/json", responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { segmentText: { type: Type.STRING }, visualPrompt: { type: Type.STRING }, visualType: { type: Type.STRING }, overlayText: { type: Type.STRING } } } } }
-                }));
-                scenes = JSON.parse((storyboardResponse.text || "[]").replace(/```json/g, '').replace(/```/g, ''));
+                const sbResp = await api.ai.generateText(
+                    `${pacingPrompt} Return a JSON object { "scenes": [ { "segmentText": "...", "visualPrompt": "...", "visualType": "...", "overlayText": "..." } ] }. Script: ${script}`,
+                    true,
+                    16000,
+                );
+                const parsed = JSON.parse((sbResp.text || "{}").replace(/```json/g, '').replace(/```/g, ''));
+                scenes = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.scenes) ? parsed.scenes : []);
+                if (scenes.length === 0) throw new Error('no scenes');
             } catch (e) { scenes = [{ segmentText: script, visualPrompt: "Concept art", visualType: "illustration", overlayText: "Topic" }]; }
 
             addLog(`Step 3/4: Voiceover (${voice})...`);
             let finalDuration = 60;
             try {
-                 const audioResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-                    model: "gemini-2.5-flash-preview-tts",
-                    contents: [{ parts: [{ text: script }] }],
-                    config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: getVoiceModel(voice) } } } },
-                 }));
-                 if (audioResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData) {
-                     const binaryString = window.atob(audioResponse.candidates[0].content.parts[0].inlineData.data);
+                 const res = await apiFetch('/api/tts/gemini', {
+                     method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify({ text: script, voiceId: voice }),
+                 });
+                 const data = await res.json();
+                 if (res.ok && data.audioData) {
+                     const binaryString = window.atob(data.audioData);
                      const bytes = new Uint8Array(binaryString.length);
                      for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
                      const blob = pcmToWav(bytes, 24000, 1);
@@ -260,16 +255,8 @@ export const TestGenerator = () => {
                  } else {
                     try {
                         const promptText = visualMode === 'Abstract' ? `Abstract background, ${selectedStyle}, ${scene.visualPrompt}` : `Style: ${selectedStyle}. Subject: ${scene.visualPrompt}`;
-                        const imageResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-                            model: 'gemini-2.5-flash-image', 
-                            contents: { parts: [{ text: promptText }] },
-                            config: { imageConfig: { aspectRatio: '16:9' } }
-                        }));
-                        if (imageResponse.candidates?.[0]?.content?.parts) {
-                            for (const p of imageResponse.candidates[0].content.parts) {
-                                if (p.inlineData?.data) { imageData = p.inlineData.data; break; }
-                            }
-                        }
+                        const imgResult = await api.ai.generateImage(promptText, '16:9');
+                        if (imgResult.success && imgResult.imageData) { imageData = imgResult.imageData; }
                     } catch (e) { imageData = createSolidColorImage('#ef4444', "Error"); }
                  }
 

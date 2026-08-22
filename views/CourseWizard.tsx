@@ -4,7 +4,6 @@ import { UploadCloud, FileText, CheckCircle2, Film, Mic, Video, Sparkles, Chevro
 import { Button } from '../components/Button';
 import { Input, TextArea } from '../components/Input';
 import { Course, CourseStatus, Module, Lesson, LessonStatus, VisualAsset, VoiceOption, CaptionStyle, GenerationMode, CaptionPosition, CaptionSize, VisualMode, Resource, ResourceType, MusicMode, CourseTheme } from '../types';
-import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
 import { pcmToWav, createSolidColorImage, exportVideoAssetsZip, safeExportCourse, getAudioDurationFromBlob, renderVideoFromLesson, downloadBlob, convertPdfToImages, compressBase64Image } from '../utils';
 import { MOCK_COURSE, CURRENT_USER, DEFAULT_ELEVEN_LABS_KEY } from '../constants';
 import { api, apiFetch } from '../api';
@@ -195,7 +194,6 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
   const [solidColor, setSolidColor] = useState<string>('#4f46e5');
   
   // Image Provider Selection (uses user's own API keys only)
-  const [selectedImageProvider, setSelectedImageProvider] = useState<'gemini' | 'openai' | 'flux' | 'flux-schnell' | 'nano-banana'>('gemini');
 
   // ElevenLabs State - Hardcoded Default
   const [elevenLabsApiKey, setElevenLabsApiKey] = useState(DEFAULT_ELEVEN_LABS_KEY);
@@ -585,13 +583,22 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
           } catch (e) { console.error("ElevenLabs generation failed", e); return null; }
       } else {
           try {
-             const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-             const modelName = getVoiceModel(voiceId);
-             const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: "gemini-2.5-flash-preview-tts", contents: [{ parts: [{ text: cleanText }] }], config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: modelName } } } }, }), 3, 5000);
-             if (response.candidates?.[0]?.content?.parts?.[0]?.inlineData) {
-                 const rawData = response.candidates[0].content.parts[0].inlineData.data;
-                 const duration = window.atob(rawData).length / 48000;
-                 return { audioData: rawData, mimeType: 'audio/pcm', duration: duration };
+             // Server-side TTS proxy — keeps the key on the server.
+             const res = await withRetry(async () => {
+                 const r = await apiFetch('/api/tts/gemini', {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify({ text: cleanText, voiceId }),
+                 });
+                 if (!r.ok) {
+                     const errorData = await r.json().catch(() => ({ error: r.statusText }));
+                     throw new Error(errorData.error || `HTTP ${r.status}`);
+                 }
+                 return r.json();
+             }, 3, 5000);
+             if (res.audioData) {
+                 const duration = window.atob(res.audioData).length / 48000;
+                 return { audioData: res.audioData, mimeType: 'audio/pcm', duration };
              }
           } catch (e) { return null; }
       }
@@ -628,31 +635,26 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
       let script = newLessonScript;
       let visuals: VisualAsset[] = [];
       
-      // If AI script generation is selected
+      // If AI script generation is selected — server-side Claude
       if (newLessonScriptMode === 'ai' && newLessonAiPrompt.trim()) {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const prompt = `Write a professional video script for a lesson titled "${newLessonTitle}". 
+        const prompt = `Write a professional video script for a lesson titled "${newLessonTitle}".
           Instructions: ${newLessonAiPrompt}
           The script should be engaging, educational, and suitable for voice narration.
           Output ONLY the script text, no formatting or headers.`;
-        const response = await withRetry<GenerateContentResponse>(() => 
-          ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: [{ text: prompt }] } })
-        );
-        script = response.text || 'Script generation failed. Please edit manually.';
+        const r = await api.ai.generateText(prompt, false, 8000);
+        script = r.text || 'Script generation failed. Please edit manually.';
       }
-      
-      // If full generation is selected, also generate visuals
+
+      // If full generation is selected, also generate visuals — server-side Claude
       if (newLessonType === 'full' && script.trim()) {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const sbResponse = await withRetry<GenerateContentResponse>(() => 
-          ai.models.generateContent({ 
-            model: 'gemini-2.5-flash', 
-            contents: { parts: [{ text: `Break this script into 3-6 distinct visual scenes. Return JSON array with segmentText, visualPrompt, visualType, overlayText for each. Script: ${script}` }] },
-            config: { responseMimeType: "application/json" }
-          })
+        const r = await api.ai.generateText(
+          `Break this script into 3-6 distinct visual scenes. Return a JSON object { "scenes": [ { "segmentText": "...", "visualPrompt": "...", "visualType": "...", "overlayText": "..." } ] }. Script: ${script}`,
+          true,
+          16000,
         );
-        const scenes = JSON.parse((sbResponse.text || "[]").replace(/```json/g, '').replace(/```/g, ''));
-        visuals = (Array.isArray(scenes) ? scenes : []).map((s: any, idx: number) => ({
+        const parsed = JSON.parse((r.text || "{}").replace(/```json/g, '').replace(/```/g, ''));
+        const scenes: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.scenes) ? parsed.scenes : []);
+        visuals = scenes.map((s: any, idx: number) => ({
           id: `v-new-${Date.now()}-${idx}`,
           prompt: s.visualPrompt || '',
           imageData: '',
@@ -781,7 +783,28 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
     setModules(prev => prev.filter((_, i) => i !== mIdx));
   };
 
-  const regenerateLessonVisuals = async (mIdx: number, lIdx: number) => { const lesson = modules[mIdx].lessons[lIdx]; if (!lesson.sourceText) return; setIsRegeneratingVisuals(lesson.id); try { const ai = new GoogleGenAI({ apiKey: process.env.API_KEY }); let pacingInstruction = "Break script into 3-6 distinct scenes."; const effectivePacing = lesson.visualPacing || visualPacing; if (effectivePacing === 'Fast') pacingInstruction = "Break script into 8-12 fast-paced scenes."; if (effectivePacing === 'Turbo') pacingInstruction = "Break script into 20-30 rapid-fire scenes (every 2-3 seconds)."; const sbResponse = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: [{ text: `${pacingInstruction} Return JSON array. Script: ${lesson.sourceText}` }] }, config: { thinkingConfig: { thinkingBudget: 1024 }, responseMimeType: "application/json", responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { segmentText: { type: Type.STRING }, visualPrompt: { type: Type.STRING }, visualType: { type: Type.STRING }, overlayText: { type: Type.STRING } } } } } })); const scenes = JSON.parse((sbResponse.text || "[]").replace(/```json/g, '').replace(/```/g, '')); const visualAssets: VisualAsset[] = (Array.isArray(scenes) ? scenes : []).map((s: any, idx: number) => ({ id: `v-regen-${Date.now()}-${idx}`, prompt: s.visualPrompt, imageData: '', type: s.visualType, overlayText: s.overlayText, scriptText: s.segmentText, startTime: 0, endTime: 0 })); setModules(prev => { const newM = [...prev]; if(newM[mIdx] && newM[mIdx].lessons[lIdx]) { newM[mIdx].lessons[lIdx].visuals = visualAssets; newM[mIdx].lessons[lIdx].status = LessonStatus.SCRIPTING; } return newM; }); } catch (e) { alert("Failed to redo storyboard."); } finally { setIsRegeneratingVisuals(null); } };
+  const regenerateLessonVisuals = async (mIdx: number, lIdx: number) => {
+    const lesson = modules[mIdx].lessons[lIdx];
+    if (!lesson.sourceText) return;
+    setIsRegeneratingVisuals(lesson.id);
+    try {
+      let pacingInstruction = "Break script into 3-6 distinct scenes.";
+      const effectivePacing = lesson.visualPacing || visualPacing;
+      if (effectivePacing === 'Fast') pacingInstruction = "Break script into 8-12 fast-paced scenes.";
+      if (effectivePacing === 'Turbo') pacingInstruction = "Break script into 20-30 rapid-fire scenes (every 2-3 seconds).";
+      const r = await api.ai.generateText(
+        `${pacingInstruction} Return a JSON object { "scenes": [ { "segmentText": "...", "visualPrompt": "...", "visualType": "...", "overlayText": "..." } ] }. Script: ${lesson.sourceText}`,
+        true,
+        24000,
+      );
+      const parsed = JSON.parse((r.text || "{}").replace(/```json/g, '').replace(/```/g, ''));
+      const scenes: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.scenes) ? parsed.scenes : []);
+      const visualAssets: VisualAsset[] = scenes.map((s: any, idx: number) => ({ id: `v-regen-${Date.now()}-${idx}`, prompt: s.visualPrompt, imageData: '', type: s.visualType, overlayText: s.overlayText, scriptText: s.segmentText, startTime: 0, endTime: 0 }));
+      setModules(prev => { const newM = [...prev]; if(newM[mIdx] && newM[mIdx].lessons[lIdx]) { newM[mIdx].lessons[lIdx].visuals = visualAssets; newM[mIdx].lessons[lIdx].status = LessonStatus.SCRIPTING; } return newM; });
+    } catch (e: any) {
+      alert(`Failed to redo storyboard: ${e?.message || 'unknown error'}`);
+    } finally { setIsRegeneratingVisuals(null); }
+  };
 
   // Export image prompts to JSON for external AI generation
   const handleExportLessonPrompts = (mIdx: number, lIdx: number) => {
@@ -1063,19 +1086,8 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
             let promptText = `Style: ${effectiveVisualStyle}. Subject: ${visual.prompt}. Aspect Ratio 16:9. No text.`;
             if (effectiveVisualMode === 'Abstract') { promptText = `Style: Abstract, ${effectiveVisualStyle}. Create an abstract artistic background based on the concept: ${visual.prompt}. Aspect Ratio 16:9. No text, no people, high quality wallpaper.`; }
             
-            // Get API keys from localStorage (user's own keys)
-            const replicateApiKey = localStorage.getItem('replicateApiKey') || '';
-            const openaiApiKey = localStorage.getItem('openaiApiKey') || '';
-            
-            // Use server-side API with selected provider from toggle
-            const result = await api.ai.generateImage(promptText, '16:9', {
-                useFlux: selectedImageProvider === 'flux',
-                useFluxSchnell: selectedImageProvider === 'flux-schnell',
-                useNanoBanana: selectedImageProvider === 'nano-banana',
-                useOpenAI: selectedImageProvider === 'openai',
-                replicateApiKey: replicateApiKey || undefined,
-                openaiApiKey: openaiApiKey || undefined,
-            });
+            // Server-side image generation (GPT Image 2)
+            const result = await api.ai.generateImage(promptText, '16:9');
             if (result.success && result.imageData) {
                 newImageData = result.imageData;
                 console.log(`Image generated via ${result.provider}`);
@@ -1135,9 +1147,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
 
   const bulkGenerateLessonImages = async (mIdx: number, lIdx: number) => {
       const lesson = modules[mIdx]?.lessons[lIdx]; if (!lesson || !lesson.visuals) return; setBulkGeneratingId(lesson.id);
-      // Check Gemini mode from settings - free accounts use 1 at a time, paid use 3
-      const geminiMode = localStorage.getItem('geminiMode') || 'paid';
-      const batchSize = (selectedImageProvider === 'gemini' && geminiMode === 'free') ? 1 : 3;
+      const batchSize = 3;
       for (let i = 0; i < lesson.visuals.length; i += batchSize) { const batch = lesson.visuals.slice(i, i + batchSize).map((_, offset) => i + offset); try { await Promise.all(batch.map(vIdx => { if (!lesson.visuals![vIdx].imageData) { return generateImageForScene(mIdx, lIdx, vIdx); } return Promise.resolve(); })); } catch(e) { console.error("Batch failed", e); } await delay(500); }
       setBulkGeneratingId(null);
   };
@@ -1146,7 +1156,6 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
 
   const renderFinalCourse = async () => {
         setStep('rendering'); setIsProcessingAI(true); setGenerationProgress(0); setRenderingStatus("Initializing Render Engine...");
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         let totalSteps = 0; let completedSteps = 0; modules.forEach(m => { m.lessons.forEach(l => { totalSteps++; if(l.visuals) totalSteps += l.visuals.length; }); });
         const initialStructure = [...modules]; let audioQuotaExceeded = false; 
         try {
@@ -1158,7 +1167,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                     // Always regenerate audio to pick up script changes - don't skip based on existing audio
                     const lessonId = lesson.id; let audioData = ""; let audioMimeType: 'audio/pcm' | 'audio/mpeg' = 'audio/pcm'; let totalDurationSeconds = 0; let currentSourceText = lesson.sourceText;
                     if (!currentSourceText || currentSourceText.length < 200) {
-                         setRenderingStatus(`Writing Script for: ${lesson.title}`); try { const prompt = `Write a natural, conversational video script (approx 400-600 words) for a course lesson titled "${lesson.title}". Context/Summary: ${currentSourceText || lesson.title}. Do not include scene directions like [Scene], just the spoken text.`; const scriptResp = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash', contents: { parts: [{ text: prompt }] } })); if (scriptResp.text) { currentSourceText = scriptResp.text; } } catch(e) {}
+                         setRenderingStatus(`Writing Script for: ${lesson.title}`); try { const prompt = `Write a natural, conversational video script (approx 400-600 words) for a course lesson titled "${lesson.title}". Context/Summary: ${currentSourceText || lesson.title}. Do not include scene directions like [Scene], just the spoken text.`; const scriptResp = await api.ai.generateText(prompt, false, 8000); if (scriptResp.text) { currentSourceText = scriptResp.text; } } catch(e) {}
                     }
                     let wordTimestamps: WordTimestamp[] = lesson.wordTimestamps || [];
                     if (!audioData && currentSourceText && !audioQuotaExceeded) {
@@ -1178,7 +1187,7 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
                     const visuals = lesson.visuals || []; const batchSize = 3;
                     for (let i = 0; i < visuals.length; i += batchSize) {
                         const batch = visuals.slice(i, i + batchSize); setRenderingStatus(`Rendering Scenes ${i + 1}-${Math.min(i + batchSize, visuals.length)} for: ${lesson.title}`);
-                        await Promise.all(batch.map(async (vis: any) => { if (!vis.imageData || vis.imageData.length < 500) { const modeToUse = lesson.visualMode || visualMode; const styleToUse = lesson.visualStyle || selectedVisualStyle; const colorToUse = lesson.solidColor || solidColor; if (modeToUse === 'Solid_Color') { vis.imageData = createSolidColorImage(colorToUse, ""); } else { try { const promptText = modeToUse === 'Abstract' ? `Abstract background, ${styleToUse}, ${vis.prompt}, Aspect Ratio 16:9` : `Style: ${styleToUse}. Subject: ${vis.prompt}. Aspect Ratio 16:9`; const imgResp = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts: [{ text: promptText }] }, config: { imageConfig: { aspectRatio: '16:9' } } })); if (imgResp.candidates?.[0]?.content?.parts) { for (const p of imgResp.candidates[0].content.parts) { if (p.inlineData?.data) { vis.imageData = await compressBase64Image(p.inlineData.data, 1280, 0.85); break; } } } } catch (e) {} } } }));
+                        await Promise.all(batch.map(async (vis: any) => { if (!vis.imageData || vis.imageData.length < 500) { const modeToUse = lesson.visualMode || visualMode; const styleToUse = lesson.visualStyle || selectedVisualStyle; const colorToUse = lesson.solidColor || solidColor; if (modeToUse === 'Solid_Color') { vis.imageData = createSolidColorImage(colorToUse, ""); } else { try { const promptText = modeToUse === 'Abstract' ? `Abstract background, ${styleToUse}, ${vis.prompt}, Aspect Ratio 16:9` : `Style: ${styleToUse}. Subject: ${vis.prompt}. Aspect Ratio 16:9`; const imgResult = await api.ai.generateImage(promptText, '16:9'); if (imgResult.success && imgResult.imageData) { vis.imageData = await compressBase64Image(imgResult.imageData, 1280, 0.85); } } catch (e) {} } } }));
                         completedSteps += batch.length; setGenerationProgress((completedSteps / totalSteps) * 100);
                     }
                     setModules(prev => prev.map(m => { if (m.id !== moduleStructure.id) return m; return { ...m, lessons: m.lessons.map(l => { if (l.id !== lessonId) return l; const updatedVisuals = [...(l.visuals || [])]; visuals.forEach((mutatedVis, idx) => { if (updatedVisuals[idx] && mutatedVis.imageData) { updatedVisuals[idx].imageData = mutatedVis.imageData; } }); let currentTimeCursor = 0; let thumbnailData = l.thumbnailData || ""; const totalChars = visuals.reduce((acc: number, v: any) => acc + (v.scriptText?.length || 20), 0) || 1; updatedVisuals.forEach((vis, i) => { if (i === 0 && !thumbnailData && vis.imageData) thumbnailData = vis.imageData; const segLen = vis.scriptText?.length || 20; const duration = (totalChars > 0 && totalDurationSeconds > 0) ? (segLen / totalChars) * totalDurationSeconds : 5; vis.startTime = currentTimeCursor; vis.endTime = currentTimeCursor + duration; vis.zoomDirection = i % 2 === 0 ? 'in' : 'out'; currentTimeCursor += duration; }); if (updatedVisuals.length > 0) updatedVisuals[updatedVisuals.length - 1].endTime = Math.max(currentTimeCursor, totalDurationSeconds + 1); return { ...l, status: LessonStatus.READY, progress: 100, audioData: audioData, audioMimeType: audioMimeType, sourceText: currentSourceText, visuals: updatedVisuals, thumbnailData: thumbnailData, duration: `${Math.floor(totalDurationSeconds / 60)}:${Math.floor(totalDurationSeconds % 60).toString().padStart(2, '0')}`, durationSeconds: totalDurationSeconds, voice: selectedVoice, captionStyle: l.captionStyle || selectedCaptionStyle, captionPosition: captionPosition, captionSize: captionSize, visualStyle: l.visualStyle || selectedVisualStyle, visualPacing: l.visualPacing || visualPacing, visualMode: visualMode, solidColor: solidColor, captionTextSource: ((l.captionStyle || selectedCaptionStyle).startsWith('Viral') || showSubtitles) ? 'script' : 'overlay', backgroundMusicUrl: (includeMusic && !l.backgroundMusicUrl) ? selectedMusicTrack : l.backgroundMusicUrl, musicMode: l.musicMode || musicMode, captionColor: captionColor, captionBgColor: captionBgColor, captionOutlineColor: captionOutlineColor, wordTimestamps: wordTimestamps.length > 0 ? wordTimestamps : l.wordTimestamps }; }) }; }));
@@ -1315,19 +1324,6 @@ export const CourseWizard: React.FC<CourseWizardProps> = ({ initialCourse, onCan
         </div>
 
         <div className="space-y-3">
-            <div className="bg-gradient-to-r from-indigo-50 to-purple-50 p-3 rounded-lg border border-indigo-100">
-              <label className="text-xs font-semibold text-slate-500 uppercase mb-2 block flex items-center gap-2">
-                <ImageIcon size={14} className="text-indigo-600" /> Image Provider
-              </label>
-              <div className="flex bg-white/80 p-1 rounded-lg shadow-inner flex-wrap gap-0.5">
-                <button onClick={() => setSelectedImageProvider('gemini')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'gemini' ? 'bg-indigo-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Gemini</button>
-                <button onClick={() => setSelectedImageProvider('openai')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'openai' ? 'bg-emerald-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>OpenAI</button>
-                <button onClick={() => setSelectedImageProvider('nano-banana')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'nano-banana' ? 'bg-pink-500 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="Nano Banana Pro">Nano</button>
-                <button onClick={() => setSelectedImageProvider('flux-schnell')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'flux-schnell' ? 'bg-amber-500 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="~$0.003/image">Schnell</button>
-                <button onClick={() => setSelectedImageProvider('flux')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'flux' ? 'bg-purple-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="~$0.04/image">Pro</button>
-              </div>
-              <p className="text-[9px] text-slate-500 mt-1.5 text-center">{selectedImageProvider === 'nano-banana' ? 'Nano Banana Pro: Google Gemini via Replicate' : selectedImageProvider === 'flux-schnell' ? 'FLUX Schnell: Fast & cheap ~$0.003/img' : selectedImageProvider === 'flux' ? 'FLUX Pro: Best quality ~$0.04/img' : 'Uses your API keys from Settings'}</p>
-            </div>
             <div><label className="text-xs font-semibold text-slate-500 uppercase mb-1 block">Slide Count / Pacing</label>
                 <div className="flex bg-slate-200/50 p-1 rounded-lg">
                     <button onClick={() => { setVisualPacing('Normal'); updateAllLessons('visualPacing', 'Normal'); }} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all flex items-center justify-center gap-1 ${visualPacing === 'Normal' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}><Timer size={12} /> Normal</button>

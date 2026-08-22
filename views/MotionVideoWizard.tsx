@@ -1022,7 +1022,7 @@ export const MotionVideoWizard: React.FC<MotionVideoWizardProps> = ({ onCancel }
                 />
                 {scriptProvider && scriptProvider !== 'you' && (
                   <p className="text-xs text-slate-400">
-                    Drafted by {scriptProvider === 'openai' ? 'GPT-4o' : scriptProvider === 'gemini' ? 'Gemini' : scriptProvider}. Edit freely before continuing.
+                    Drafted by {scriptProvider === 'claude' ? 'Claude' : scriptProvider}. Edit freely before continuing.
                   </p>
                 )}
               </section>

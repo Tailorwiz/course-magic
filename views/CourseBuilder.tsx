@@ -7,19 +7,7 @@ import {
     FolderPlus, Check, X, ArrowLeft, Sparkles, Image as ImageIcon,
     CheckSquare, Square, Layers, Save, Upload, Loader2
 } from 'lucide-react';
-import { GoogleGenAI, GenerateContentResponse } from '@google/genai';
 import { api } from '../api';
-
-const getGeminiApiKey = (): string => {
-    if (typeof window !== 'undefined' && (window as any).GEMINI_API_KEY) {
-        return (window as any).GEMINI_API_KEY;
-    }
-    try {
-        const stored = localStorage.getItem('geminiApiKey');
-        if (stored) return stored;
-    } catch (e) {}
-    return '';
-};
 
 interface CourseBuilderProps {
     videos: Course[]; // All standalone videos (type: 'video')
@@ -75,34 +63,18 @@ export const CourseBuilder: React.FC<CourseBuilderProps> = ({ videos, onCreateCo
             alert("Please enter a course title first.");
             return;
         }
-        const apiKey = getGeminiApiKey();
-        if (!apiKey) {
-            alert("Gemini API key not configured. Please set it in Global Settings.");
-            return;
-        }
-        
         setIsGeneratingCover(true);
         try {
-            const ai = new GoogleGenAI({ apiKey });
             const prompt = `Design a premium course cover image for a professional online course titled "${courseTitle}". ${courseHeadline ? `Subtitle: "${courseHeadline}".` : ''} Style: Clean, modern, professional, high-end education platform aesthetic. Think masterclass or executive training program. ${coverInstructions ? `Additional instructions: ${coverInstructions}` : ''} Do NOT include any text in the image - just beautiful visual design.`;
-            
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image',
-                contents: { parts: [{ text: prompt }] },
-                config: { imageConfig: { aspectRatio: '3:4' as any } }
-            }) as GenerateContentResponse;
-            
-            if (response.candidates?.[0]?.content?.parts) {
-                for (const part of response.candidates[0].content.parts) {
-                    if (part.inlineData && part.inlineData.data) {
-                        setCourseCover(`data:image/png;base64,${part.inlineData.data}`);
-                        break;
-                    }
-                }
+
+            // Server-side image generation (GPT Image 2)
+            const result = await api.ai.generateImage(prompt, '3:4');
+            if (result.success && result.imageData) {
+                setCourseCover(`data:image/png;base64,${result.imageData}`);
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error("Cover generation failed:", error);
-            alert("Failed to generate cover image. Please try again.");
+            alert(`Failed to generate cover image: ${error?.message || 'unknown error'}`);
         } finally {
             setIsGeneratingCover(false);
         }

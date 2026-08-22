@@ -3333,12 +3333,15 @@ async function generateWithClaude(opts: {
   }
   content.push({ type: 'text', text: opts.prompt });
 
-  const response = await anthropic.messages.create({
+  // Stream and collect: the SDK rejects non-streaming requests whose
+  // max_tokens implies a potentially >10-minute response (large storyboards).
+  const stream = anthropic.messages.stream({
     model: CLAUDE_MODEL,
     max_tokens: opts.maxTokens || 4000,
     system: opts.system,
     messages: [{ role: 'user', content }],
   });
+  const response = await stream.finalMessage();
   const block = response.content.find((b) => b.type === 'text') as
     | { type: 'text'; text: string }
     | undefined;
@@ -3663,24 +3666,39 @@ app.post("/api/test-flux", requireRole("CREATOR"), async (req, res) => {
   }
 });
 
-// AI Text Generation — Claude only
+// AI Text Generation — Claude only. Accepts an optional `maxTokens` (large
+// storyboards need well beyond the old 4096 cap — that cap silently truncated
+// the JSON and broke storyboard generation) and optional `images` (base64
+// data: URLs) so flows like the slide-deck analyzer send images through the
+// server instead of calling a provider from the browser.
 app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
-  const { prompt, jsonMode = false, useOpenAI = false } = req.body;
-  
+  const { prompt, jsonMode = false, maxTokens, images } = req.body;
+
   if (!prompt) {
     return res.status(400).json({ error: "Prompt is required" });
   }
-  
+
   // Claude only — no fallback. If it fails, the real error is returned.
   if (!anthropic) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for text generation.' });
   }
   try {
+    const tokens = Math.min(Math.max(Number(maxTokens) || 8192, 256), 32000);
+    const imageParts = (Array.isArray(images) ? images : [])
+      .slice(0, 30)
+      .map((u: any) => {
+        const s = String(u || '');
+        const m = s.match(/^data:(image\/[a-z+.-]+);base64,(.+)$/i);
+        return m ? { mediaType: m[1], data: m[2] } : null;
+      })
+      .filter(Boolean) as { mediaType: string; data: string }[];
+
     const finalPrompt = jsonMode
       ? `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`
       : prompt;
-    const text = await generateWithClaude({ prompt: finalPrompt, maxTokens: 4096 });
+    let text = await generateWithClaude({ prompt: finalPrompt, maxTokens: tokens, images: imageParts });
     if (!text) throw new Error('No text in Claude response');
+    if (jsonMode) text = text.replace(/```json/gi, '').replace(/```/g, '').trim();
     return res.json({ text, provider: 'claude', success: true });
   } catch (claudeErr: any) {
     console.error('Claude text gen failed:', claudeErr?.message);
@@ -3688,6 +3706,36 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
       error: 'Text generation failed',
       details: String(claudeErr?.message || claudeErr).slice(0, 300),
     });
+  }
+});
+
+// Student-facing support chat — Claude with a fixed, server-side prompt.
+// requireAuth (not CREATOR) because students use the help widget.
+app.post("/api/ai/support-chat", requireAuth, async (req, res) => {
+  const { message } = req.body;
+  if (!message || typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: "message is required" });
+  }
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for support chat.' });
+  }
+  try {
+    const text = await generateWithClaude({
+      maxTokens: 500,
+      system: `You are a helpful support assistant for an online course platform called "Jobs On Demand".
+Guidelines:
+- Be polite and professional.
+- If the user asks about technical issues, suggest clearing cache or trying a different browser.
+- If they ask about course content, tell them to check the course details or ask the instructor.
+- If the issue seems complex or they are unhappy, suggest escalating to a human agent.
+- Keep answers concise.`,
+      prompt: String(message).slice(0, 2000),
+    });
+    if (!text) throw new Error('No text in Claude response');
+    return res.json({ text, success: true });
+  } catch (e: any) {
+    console.error('Support chat failed:', e?.message);
+    return res.status(500).json({ error: 'Support chat failed', details: String(e?.message || e).slice(0, 200) });
   }
 });
 
@@ -4137,11 +4185,13 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
         : prompt;
       content.push({ type: 'text', text: finalPrompt });
 
-      const response = await anthropic.messages.create({
+      // Stream and collect — required for large max_tokens (see generateWithClaude).
+      const fileStream = anthropic.messages.stream({
         model: CLAUDE_MODEL,
-        max_tokens: maxTokens || 4096,
+        max_tokens: Math.min(Math.max(Number(maxTokens) || 4096, 256), 32000),
         messages: [{ role: 'user', content }],
       });
+      const response = await fileStream.finalMessage();
       const block = response.content.find((b) => b.type === 'text') as
         | { type: 'text'; text: string }
         | undefined;

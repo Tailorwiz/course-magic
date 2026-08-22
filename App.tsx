@@ -26,7 +26,6 @@ import { Award, BookOpen, CheckCircle2, Shield, Key, RefreshCcw, Trash2, Video, 
 import { safeExportCourse, stripHeavyAssets, exportCourseAsZip, exportAllDataAsZip, saveCourseToDB, getCourseFromDB } from './utils';
 import { Input, TextArea } from './components/Input';
 import { Button } from './components/Button';
-import { GoogleGenAI } from "@google/genai";
 import { api, apiFetch, clearToken, getToken, setToken } from './api';
 
 const formatDuration = (totalSeconds: number): string => {
@@ -535,24 +534,13 @@ export const App = () => {
       setIsChatTyping(true);
 
       try {
-          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-          const prompt = `You are a helpful support assistant for an online course platform called "Jobs On Demand".
-          User Question: "${userMsg.text}"
-          
-          Guidelines:
-          - Be polite and professional.
-          - If the user asks about technical issues, suggest clearing cache or trying a different browser.
-          - If they ask about course content, tell them to check the course details or ask the instructor.
-          - If the issue seems complex or they are unhappy, suggest escalating to a human agent.
-          - Keep answers concise.
-          `;
-          
-          const response = await ai.models.generateContent({
-              model: 'gemini-2.5-flash',
-              contents: { parts: [{ text: prompt }] }
+          const resp = await apiFetch('/api/ai/support-chat', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: userMsg.text }),
           });
-          
-          const aiText = response.text || "I'm having trouble connecting. Please try again.";
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Chat failed');
+          const aiText = data.text || "I'm having trouble connecting. Please try again.";
           setChatHistory(prev => [...prev, { sender: 'ai', text: aiText }]);
       } catch (e) {
           setChatHistory(prev => [...prev, { sender: 'ai', text: "Sorry, I'm offline right now. Please escalate to a human." }]);

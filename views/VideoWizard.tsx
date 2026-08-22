@@ -4,7 +4,6 @@ import { UploadCloud, CheckCircle2, Video, Sparkles, Image as ImageIcon, Loader2
 import { Button } from '../components/Button';
 import { Input, TextArea } from '../components/Input';
 import { Course, CourseStatus, LessonStatus, VisualAsset, VoiceOption, CaptionStyle, VisualMode, MusicMode, GenerationMode, CaptionPosition, CaptionSize, CaptionMode, CourseTheme, Resource } from '../types';
-import { GoogleGenAI, Modality, GenerateContentResponse, Type } from "@google/genai";
 import { pcmToWav, createSolidColorImage, exportVideoAssetsZip, safeExportCourse, getAudioDurationFromBlob, renderVideoFromLesson, downloadBlob, convertPdfToImages, compressBase64Image } from '../utils';
 import { DEFAULT_ELEVEN_LABS_KEY } from '../constants';
 import { api, apiFetch } from '../api';
@@ -101,27 +100,7 @@ const CAPTION_STYLES: CaptionStyle[] = [
     'Modern', 'Cinematic', 'Outline', 'Minimalist', 'Neon Glow', 'Typewriter', 'None'
 ];
 
-const AI_MODELS = [
-    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Fastest, good quality' },
-    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Higher quality, slower' },
-    { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite', desc: 'Ultra-fast, high volume' },
-];
-
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Helper to get the API key - checks localStorage first, then falls back to environment variable
-const getGeminiApiKey = (): string => {
-    const savedKey = localStorage.getItem('geminiApiKey');
-    if (savedKey && savedKey.trim()) {
-        return savedKey.trim();
-    }
-    return import.meta.env.VITE_GEMINI_API_KEY || process.env.API_KEY || '';
-};
-
-// Helper to get the default AI model from localStorage
-const getDefaultAIModel = (): string => {
-    return localStorage.getItem('defaultAIModel') || 'gemini-2.5-flash';
-};
 
 // Helper function to fix concatenated words in AI-generated text
 const fixConcatenatedText = (text: string): string => {
@@ -269,7 +248,6 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
   const [strategy, setStrategy] = useState<GenerationMode>('hybrid');
   const [durationMode, setDurationMode] = useState<string>(initialType === 'Social Short' ? 'short' : 'medium');
   const [strategyInstructions, setStrategyInstructions] = useState('');
-  const [selectedAIModel, setSelectedAIModel] = useState<string>(getDefaultAIModel());
   const [isFaithBased, setIsFaithBased] = useState(false);
   
   // Video Source Mode: 'ai_generated' (create with slides) or 'hosted' (use external video URL)
@@ -283,8 +261,6 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
   const [selectedCaptionStyle, setSelectedCaptionStyle] = useState<CaptionStyle>(typeConfig.captionStyle as CaptionStyle);
   const [visualPacing, setVisualPacing] = useState<'Normal' | 'Fast' | 'Turbo'>(typeConfig.visualPacing as any);
   
-  // Image Provider Selection (uses user's own API keys only)
-  const [selectedImageProvider, setSelectedImageProvider] = useState<'gemini' | 'openai' | 'flux' | 'flux-schnell' | 'nano-banana'>('gemini');
   
   // Voice Control Settings
   const [voiceSpeed, setVoiceSpeed] = useState<number>(1.0); // 0.5 to 2.0
@@ -842,35 +818,24 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
     if(slideDeckImages.length === 0) return;
     setIsAnalyzingSlides(true);
     try {
-        const ai = new GoogleGenAI({ apiKey: getGeminiApiKey() });
-        const parts: any[] = [];
-        
         const imagesToProcess = slideDeckImages.slice(0, 30);
-        for(const imgBase64 of imagesToProcess) {
-             const data = imgBase64.split(',')[1];
-             const mimeType = imgBase64.split(';')[0].split(':')[1];
-             parts.push({ inlineData: { data, mimeType } });
-        }
-        
-        const prompt = `I have uploaded ${imagesToProcess.length} slides from a presentation. 
+
+        const prompt = `I have uploaded ${imagesToProcess.length} slides from a presentation.
         Task: Write a professional, engaging video narration script for this presentation.
-        Output Format: A JSON array of objects. Each object must represent one slide in order.
-        Structure: [ { "slideIndex": 0, "narration": "..." }, { "slideIndex": 1, "narration": "..." }, ... ]
+        Output Format: A JSON object with a "slides" array. Each object must represent one slide in order.
+        Structure: { "slides": [ { "slideIndex": 0, "narration": "..." }, { "slideIndex": 1, "narration": "..." }, ... ] }
         The narration should match the content of the slide. Keep it concise but informative.`;
-        
-        parts.push({ text: prompt });
-        
-        const response = await withRetry<GenerateContentResponse>(() => ai.models.generateContent({
-            model: selectedAIModel,
-            contents: { parts },
-            config: { responseMimeType: "application/json" }
-        }));
-        
-        let jsonStr = response.text || "[]";
-        jsonStr = jsonStr.replace(/,\s*\]/g, ']').replace(/,\s*\}/g, '}');
-        
+
+        const resp = await apiFetch('/api/ai/generate-text', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, jsonMode: true, maxTokens: 16000, images: imagesToProcess })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Slide analysis failed');
+
+        let jsonStr = (data.text || "{}").replace(/,\s*\]/g, ']').replace(/,\s*\}/g, '}');
         const json = JSON.parse(jsonStr);
-        const slidesData = Array.isArray(json) ? json : [];
+        const slidesData: any[] = Array.isArray(json) ? json : (Array.isArray(json.slides) ? json.slides : []);
         
         const newVisuals: VisualAsset[] = imagesToProcess.map((img, idx) => {
             const narration = slidesData.find((s: any) => s.slideIndex === idx)?.narration || "";
@@ -995,20 +960,9 @@ export const VideoWizard: React.FC<VideoWizardProps> = ({ onCancel, onComplete, 
            
            // Use 3:4 aspect ratio for ecovers to match course covers
            const ecoverAspectRatio = '3:4';
-           
-           // Get API keys from localStorage (user's own keys)
-           const replicateApiKey = localStorage.getItem('replicateApiKey') || '';
-           const openaiApiKey = localStorage.getItem('openaiApiKey') || '';
-           
-           // Use server-side API with selected provider from toggle
-           const result = await api.ai.generateImage(prompt, ecoverAspectRatio, {
-               useFlux: selectedImageProvider === 'flux',
-               useFluxSchnell: selectedImageProvider === 'flux-schnell',
-               useNanoBanana: selectedImageProvider === 'nano-banana',
-               useOpenAI: selectedImageProvider === 'openai',
-               replicateApiKey: replicateApiKey || undefined,
-               openaiApiKey: openaiApiKey || undefined,
-           });
+
+           // Server-side image generation (GPT Image 2)
+           const result = await api.ai.generateImage(prompt, ecoverAspectRatio);
            if (result.success && result.imageData) {
                setEcoverPreview(`data:image/png;base64,${result.imageData}`);
                console.log(`Ecover generated via ${result.provider}`);
@@ -1361,9 +1315,12 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
       finalPrompt += `\n\nRETURN JSON: { "scenes": [ { "segmentText": "...", "visualPrompt": "...", "visualType": "...", "overlayText": "..." } ] }`;
       try {
           setStoryboardProgress('Breaking script into visual scenes...');
+          // Long scripts produce big storyboard JSON — request a high token cap
+          // so the response never truncates mid-JSON (the old 4096 default was
+          // exactly why storyboards silently came back empty).
           const resp = await apiFetch('/api/ai/generate-text', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ prompt: finalPrompt, jsonMode: true })
+              body: JSON.stringify({ prompt: finalPrompt, jsonMode: true, maxTokens: 24000 })
           });
           const data = await resp.json();
           if (!resp.ok) throw new Error(data.error || 'Storyboard failed');
@@ -1375,7 +1332,14 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
           const newVisuals: VisualAsset[] = scenes.map((s: any, idx: number) => ({ id: `v-${Date.now()}-${idx}`, prompt: s.visualPrompt || '', imageData: '', type: s.visualType || 'illustration', overlayText: s.overlayText || '', scriptText: fixConcatenatedText(s.segmentText || ''), startTime: 0, endTime: 0 }));
           setStoryboardProgress(`Storyboard complete: ${scenes.length} scenes`);
           return newVisuals;
-      } catch (e) { console.error("Storyboard failed", e); setStoryboardProgress('Storyboard generation failed'); return []; }
+      } catch (e: any) {
+          // Surface the real failure — a silently empty storyboard looks like
+          // "nothing happened" and hides the actual problem.
+          console.error("Storyboard failed", e);
+          setStoryboardProgress(`Storyboard generation failed: ${e?.message || 'unknown error'}`);
+          alert(`Storyboard generation failed: ${e?.message || 'unknown error'}`);
+          return [];
+      }
   };
   
   // Wrapper that updates state directly (for regeneration when state is already correct)
@@ -1489,19 +1453,8 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
                   promptText = `${styleContext} Subject: ${visualToGen.prompt}. IMPORTANT: If any company names, brand logos, product names, websites, universities, or specific entities are mentioned, visually represent them accurately (show recognizable imagery associated with those brands/entities). Aspect Ratio ${targetAspectRatio}. No text.`;
               }
 
-              // Get API keys from localStorage (user's own keys)
-              const replicateApiKey = localStorage.getItem('replicateApiKey') || '';
-              const openaiApiKey = localStorage.getItem('openaiApiKey') || '';
-              
-              // Use server-side API with selected provider from toggle
-              const result = await api.ai.generateImage(promptText, targetAspectRatio, {
-                  useFlux: selectedImageProvider === 'flux',
-                  useFluxSchnell: selectedImageProvider === 'flux-schnell',
-                  useNanoBanana: selectedImageProvider === 'nano-banana',
-                  useOpenAI: selectedImageProvider === 'openai',
-                  replicateApiKey: replicateApiKey || undefined,
-                  openaiApiKey: openaiApiKey || undefined,
-              });
+              // Server-side image generation (GPT Image 2)
+              const result = await api.ai.generateImage(promptText, targetAspectRatio);
               if (result.success && result.imageData) {
                   imageData = result.imageData;
                   console.log(`Image generated via ${result.provider} for ${visualId}`);
@@ -1527,9 +1480,7 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
       const imageStart = Date.now();
       setGenerationStartTime(Date.now());
       let completedCount = 0;
-      // Check Gemini mode from settings - free accounts use 1 at a time, paid use 3
-      const geminiMode = localStorage.getItem('geminiMode') || 'paid';
-      const concurrencyLimit = (selectedImageProvider === 'gemini' && geminiMode === 'free') ? 1 : 3;
+      const concurrencyLimit = 3;
       await runConcurrentTasks(tasks, async (task: { partId: string, visualId: string }) => {
           await generateImageForVisual(task.partId, task.visualId);
           completedCount++;
@@ -2555,21 +2506,6 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
             </div>
           </div>
 
-          {/* VISUALS */}
-          <div className="bg-gradient-to-r from-indigo-50 to-purple-50 p-3 rounded-lg border border-indigo-100">
-            <label className="text-xs font-bold text-slate-500 uppercase mb-2 block flex items-center gap-2">
-              <ImageIcon size={14} className="text-indigo-600" /> Image Provider
-            </label>
-            <div className="flex bg-white/80 p-1 rounded-lg shadow-inner flex-wrap gap-0.5">
-              <button onClick={() => setSelectedImageProvider('gemini')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'gemini' ? 'bg-indigo-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>Gemini</button>
-              <button onClick={() => setSelectedImageProvider('openai')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'openai' ? 'bg-emerald-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`}>OpenAI</button>
-              <button onClick={() => setSelectedImageProvider('nano-banana')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'nano-banana' ? 'bg-pink-500 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="Nano Banana Pro">Nano</button>
-              <button onClick={() => setSelectedImageProvider('flux-schnell')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'flux-schnell' ? 'bg-amber-500 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="~$0.003/image">Schnell</button>
-              <button onClick={() => setSelectedImageProvider('flux')} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${selectedImageProvider === 'flux' ? 'bg-purple-600 text-white shadow' : 'text-slate-500 hover:text-slate-700'}`} title="~$0.04/image">Pro</button>
-            </div>
-            <p className="text-[9px] text-slate-500 mt-1.5 text-center">{selectedImageProvider === 'nano-banana' ? 'Nano Banana Pro: Google Gemini via Replicate' : selectedImageProvider === 'flux-schnell' ? 'FLUX Schnell: Fast & cheap ~$0.003/img' : selectedImageProvider === 'flux' ? 'FLUX Pro: Best quality ~$0.04/img' : 'Uses your API keys from Settings'}</p>
-          </div>
-          
           <div><label className="text-xs font-bold text-slate-500 uppercase mb-1 block">Visual Density</label>
             <div className="flex bg-slate-200 p-1 rounded-lg">
                 <button onClick={() => handleSettingChange('visualPacing', 'Normal', setVisualPacing)} className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${getEffectiveSetting(visualPacing, 'visualPacing') === 'Normal' ? 'bg-white shadow text-indigo-600' : 'text-slate-500 hover:text-slate-700'}`}>Normal</button>
@@ -2947,7 +2883,6 @@ Example: If script says "In Section 2, we cover the LinkedIn Strategy where you'
                              <div className="grid grid-cols-3 gap-4">{[{id: 'strict', label: 'Strict Adaptation', desc: 'Stick to source text.'}, {id: 'hybrid', label: 'Hybrid Enhancement', desc: 'Add examples & flow.'}, {id: 'creative', label: 'Creative Expansion', desc: 'Use source as inspo.'}].map((m: any) => (<button key={m.id} onClick={() => setStrategy(m.id)} className={`p-4 rounded-xl border text-left transition-all ${strategy === m.id ? 'bg-indigo-50 border-indigo-500 ring-1 ring-indigo-500' : 'border-slate-200 hover:border-indigo-200'}`}><div className="font-bold text-slate-900">{m.label}</div><div className="text-xs text-slate-500 mt-1">{m.desc}</div></button>))}</div>
                              <div><label className="block text-sm font-bold text-slate-700 mb-2">Target Duration</label><div className="grid grid-cols-1 md:grid-cols-2 gap-3">{VIDEO_DURATIONS.map(d => (<button key={d.value} onClick={() => setDurationMode(d.value)} className={`flex items-center gap-3 p-3 rounded-lg border text-left transition-all ${durationMode === d.value ? 'bg-emerald-50 border-emerald-500 text-emerald-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}><div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${durationMode === d.value ? 'border-emerald-500' : 'border-slate-300'}`}>{durationMode === d.value && <div className="w-2 h-2 rounded-full bg-emerald-50"/>}</div><span className="text-sm font-medium">{d.label}</span></button>))}</div></div>
                              <TextArea label="Specific Instructions" value={strategyInstructions} onChange={e => setStrategyInstructions(e.target.value)} placeholder="e.g. Use a humorous tone, focus on the second paragraph..." />
-                             <div><label className="block text-sm font-bold text-slate-700 mb-2">AI Model</label><div className="grid grid-cols-3 gap-3">{AI_MODELS.map(m => (<button key={m.id} onClick={() => setSelectedAIModel(m.id)} className={`p-3 rounded-lg border text-left transition-all ${selectedAIModel === m.id ? 'bg-purple-50 border-purple-500 ring-1 ring-purple-500' : 'border-slate-200 hover:border-purple-200'}`}><div className="font-bold text-sm text-slate-900">{m.label}</div><div className="text-xs text-slate-500 mt-1">{m.desc}</div></button>))}</div></div>
                              {initialType === 'Training' && (<label className="flex items-center gap-3 p-4 border border-slate-200 rounded-xl cursor-pointer hover:bg-amber-50 hover:border-amber-300 transition-all"><input type="checkbox" checked={isFaithBased} onChange={e => setIsFaithBased(e.target.checked)} className="w-5 h-5 rounded text-amber-600 focus:ring-amber-500" /><div><span className="font-bold text-slate-900">Faith-Based Script</span><span className="text-xs text-slate-500 block mt-0.5">Include references to God and faith throughout the training</span></div></label>)}
                          </>
                      )}

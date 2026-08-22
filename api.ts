@@ -667,40 +667,26 @@ export const api = {
   },
 
   ai: {
+    // Image generation — GPT Image 2 on the server. No provider options.
     async generateImage(
-      prompt: string, 
-      aspectRatio: string = "16:9", 
-      options: { useOpenAI?: boolean; useFlux?: boolean; useFluxSchnell?: boolean; useNanoBanana?: boolean; replicateApiKey?: string; openaiApiKey?: string } = {}
+      prompt: string,
+      aspectRatio: string = "16:9",
     ): Promise<{ imageData: string; provider: string; success: boolean }> {
-      const { useOpenAI = false, useFlux = false, useFluxSchnell = false, useNanoBanana = false, replicateApiKey, openaiApiKey } = options;
       const res = await apiFetch(`${API_BASE}/ai/generate-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, aspectRatio, useOpenAI, useFlux, useFluxSchnell, useNanoBanana, replicateApiKey, openaiApiKey }),
+        body: JSON.stringify({ prompt, aspectRatio }),
       });
       return handleResponse<{ imageData: string; provider: string; success: boolean }>(res);
     },
-    async generateText(prompt: string, jsonMode: boolean = false, useOpenAI: boolean = false): Promise<{ text: string; provider: string; success: boolean }> {
+    // Text generation — Claude on the server.
+    async generateText(prompt: string, jsonMode: boolean = false, maxTokens?: number): Promise<{ text: string; provider: string; success: boolean }> {
       const res = await apiFetch(`${API_BASE}/ai/generate-text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, jsonMode, useOpenAI }),
+        body: JSON.stringify({ prompt, jsonMode, maxTokens }),
       });
       return handleResponse<{ text: string; provider: string; success: boolean }>(res);
     },
-  },
-
-  async testFlux(replicateApiKey: string): Promise<{ success: boolean; message?: string; error?: string; imageData?: string }> {
-    try {
-      const res = await apiFetch(`${API_BASE}/test-flux`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ replicateApiKey }),
-      });
-      const data = await res.json();
-      return data;
-    } catch (error: any) {
-      return { success: false, error: error?.message || 'Connection failed' };
-    }
   },
 };
