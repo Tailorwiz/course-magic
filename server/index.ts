@@ -3300,9 +3300,10 @@ const openai = new OpenAI({
   baseURL: normalizeOpenAIBaseURL(process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) || undefined,
 });
 
-// Claude — the primary text/vision model for the motion-video pipeline
-// (script writing, scene direction, theme extraction, document analysis).
-// OpenAI (gpt-4o) is the automatic fallback; image generation stays on OpenAI.
+// Claude — THE text/vision model for every AI endpoint (script writing, scene
+// direction, theme extraction, document analysis, metadata, takeaways, resume
+// parsing). No fallbacks anywhere: if Claude fails, the real error is returned.
+// Image generation runs on OpenAI GPT Image 2 only, also without fallback.
 const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
@@ -3310,8 +3311,8 @@ const CLAUDE_MODEL = 'claude-sonnet-5';
 
 /**
  * Call Claude for a text/JSON generation. Returns the raw text (which callers
- * strip of code fences and parse if they want JSON). Throws on any error so
- * the endpoint's OpenAI-fallback path can kick in.
+ * strip of code fences and parse if they want JSON). Throws on any error —
+ * endpoints surface that error to the caller honestly (no fallbacks).
  *
  * `images`: optional array of { mediaType, data } base64 image parts for
  * vision inputs. `system`: optional system prompt.
@@ -3344,51 +3345,26 @@ async function generateWithClaude(opts: {
   return block?.text || '';
 }
 
-// Fallback image generator via OpenAI. Tries gpt-image-1 first (newer, photoreal,
-// closer to Gemini's look), falls back to DALL-E 3 if the org isn't verified for
-// gpt-image-1. Returns base64 (no data: prefix) so callers can stay compatible
-// with the existing Gemini response shape.
+// Image generator — OpenAI's flagship GPT Image 2, high quality. No fallback:
+// if it fails, the error is surfaced honestly to the caller. Returns base64
+// (no data: prefix).
+const OPENAI_IMAGE_MODEL = 'gpt-image-2';
 async function generateImageOpenAI(prompt: string, aspectRatio: string = '16:9'): Promise<{ b64: string; model: string }> {
-  // gpt-image-1 supports: 1024x1024, 1024x1536, 1536x1024
   let gptSize: '1024x1024' | '1024x1536' | '1536x1024' = '1024x1024';
   if (aspectRatio === '16:9' || aspectRatio === '4:3') gptSize = '1536x1024';
   else if (aspectRatio === '9:16' || aspectRatio === '3:4' || aspectRatio === '2:3') gptSize = '1024x1536';
 
-  // dall-e-3 supports: 1024x1024, 1024x1792, 1792x1024
-  let dalleSize: '1024x1024' | '1024x1792' | '1792x1024' = '1024x1024';
-  if (aspectRatio === '16:9' || aspectRatio === '4:3') dalleSize = '1792x1024';
-  else if (aspectRatio === '9:16' || aspectRatio === '3:4' || aspectRatio === '2:3') dalleSize = '1024x1792';
-
-  // Attempt 1: gpt-image-1 at HIGH quality. Without an explicit quality the API
-  // defaults to 'auto' which usually renders low/medium — visibly soft, flat
-  // images. 'high' gives sharp, detailed, photoreal output (closest to Gemini).
-  try {
-    const resp = await (openai.images as any).generate({
-      model: 'gpt-image-1',
-      prompt,
-      n: 1,
-      size: gptSize,
-      quality: 'high',
-    });
-    const b64 = resp?.data?.[0]?.b64_json;
-    if (b64) return { b64, model: 'gpt-image-1' };
-    throw new Error('gpt-image-1 returned no b64_json');
-  } catch (err: any) {
-    console.warn('gpt-image-1 (high) failed, trying dall-e-3:', String(err?.message || err).slice(0, 200));
-  }
-
-  // Attempt 2: dall-e-3 at HD quality (was 'standard' — noticeably softer).
+  // Explicit 'high' quality — the API's 'auto' default often renders soft/flat.
   const resp = await (openai.images as any).generate({
-    model: 'dall-e-3',
+    model: OPENAI_IMAGE_MODEL,
     prompt,
     n: 1,
-    size: dalleSize,
-    response_format: 'b64_json',
-    quality: 'hd',
+    size: gptSize,
+    quality: 'high',
   });
   const b64 = resp?.data?.[0]?.b64_json;
-  if (!b64) throw new Error('dall-e-3 returned no b64_json');
-  return { b64, model: 'dall-e-3' };
+  if (!b64) throw new Error(`${OPENAI_IMAGE_MODEL} returned no image data`);
+  return { b64, model: OPENAI_IMAGE_MODEL };
 }
 
 app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
@@ -3397,171 +3373,77 @@ app.post("/api/ai/generate-image", requireRole("CREATOR"), async (req, res) => {
   if (!prompt) {
     return res.status(400).json({ error: "Prompt is required" });
   }
-
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!geminiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is required for image generation.' });
+  if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
+    return res.status(500).json({ error: 'OpenAI API key is required for image generation.' });
   }
 
-  // Try the premium Gemini 3 Pro Image model first (best quality, lowest daily quota).
-  // On rate-limit (429 / RESOURCE_EXHAUSTED), automatically fall back to the higher-quota
-  // Gemini 2.5 Flash Image model — same Gemini family, same provider, just more headroom.
-  const tryModel = async (model: string, label: string) => {
-    console.log(`Generating image with ${label} (${model})...`);
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-    const response = await ai.models.generateContent({
-      model,
-      contents: { parts: [{ text: prompt }] },
-      config: {
-        responseModalities: ['TEXT', 'IMAGE'],
-        imageConfig: { aspectRatio: aspectRatio },
-      },
+  // GPT Image 2 only — no fallback. If it fails, report the real error.
+  try {
+    const { b64, model } = await generateImageOpenAI(prompt, aspectRatio);
+    console.log(`Image generated via ${model}`);
+    return res.json({ imageData: b64, provider: `openai-${model}`, success: true });
+  } catch (err: any) {
+    console.error('Image generation failed:', String(err?.message || err).slice(0, 300));
+    return res.status(500).json({
+      error: `Image generation failed (${OPENAI_IMAGE_MODEL})`,
+      details: String(err?.message || err).slice(0, 300),
     });
-    if (response.candidates?.[0]?.content?.parts) {
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData?.data) {
-          return part.inlineData.data;
-        }
-      }
-    }
-    throw new Error(`No image data in ${label} response`);
-  };
-
-  let firstError: any = null;
-  try {
-    const data = await tryModel('gemini-3-pro-image-preview', 'Gemini 3 Pro');
-    console.log('Gemini 3 Pro image generated successfully');
-    return res.json({ imageData: data, provider: 'gemini-3-pro', success: true });
-  } catch (err: any) {
-    firstError = err;
-    const msg = String(err?.message || err);
-    const isRate = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('exceeded');
-    console.warn(`Gemini 3 Pro failed${isRate ? ' (rate-limited)' : ''}, trying Gemini 2.5 Flash Image:`, msg.slice(0, 200));
   }
-
-  let secondError: any = null;
-  try {
-    const data = await tryModel('gemini-2.5-flash-image', 'Gemini 2.5 Flash Image');
-    console.log('Gemini 2.5 Flash Image generated successfully (fallback)');
-    return res.json({ imageData: data, provider: 'gemini-2.5-flash', success: true, fellBackFrom: 'gemini-3-pro' });
-  } catch (err: any) {
-    secondError = err;
-    console.warn('Gemini 2.5 Flash also failed, trying OpenAI image gen:', String(err?.message || err).slice(0, 200));
-  }
-
-  // Both Gemini models failed → OpenAI image gen as last resort.
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
-    try {
-      const { b64, model } = await generateImageOpenAI(prompt, aspectRatio);
-      console.log(`OpenAI image generated successfully via ${model} (fallback from Gemini)`);
-      return res.json({ imageData: b64, provider: `openai-${model}`, success: true, fellBackFrom: 'gemini' });
-    } catch (err: any) {
-      console.error('OpenAI image gen also failed:', String(err?.message || err).slice(0, 300));
-      return res.status(500).json({
-        error: 'Image generation failed across all providers.',
-        gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
-        gemini25FlashError: String(secondError?.message || secondError).slice(0, 300),
-        openaiError: String(err?.message || err).slice(0, 300),
-      });
-    }
-  }
-
-  return res.status(500).json({
-    error: 'Image generation failed — both Gemini models exhausted, no OpenAI key configured.',
-    gemini3ProError: String(firstError?.message || firstError).slice(0, 300),
-    gemini25FlashError: String(secondError?.message || secondError).slice(0, 300),
-  });
 });
 
 
-// AI Cover Generation endpoint - generates book covers with Gemini
+// AI Cover Generation — GPT Image 2 only, no fallback. When an existing cover
+// is provided, it's sent through images.edit so the layout/background is kept
+// and only the text is replaced (GPT Image 2 supports high-fidelity image input).
 app.post("/api/ai/generate-cover", requireRole("CREATOR"), async (req, res) => {
   const { title, headline, instructions, existingImage } = req.body;
 
   if (!title) {
     return res.status(400).json({ error: "Title is required" });
   }
-
-  // Hoisted so the OpenAI fallback in catch() can read it.
-  const isEditing = !!(existingImage && existingImage.startsWith('data:image'));
-
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (!geminiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is required for cover generation.' });
+  if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
+    return res.status(500).json({ error: 'OpenAI API key is required for cover generation.' });
   }
 
+  const isEditing = !!(existingImage && existingImage.startsWith('data:image'));
+
   try {
-    console.log('Generating AI cover with Gemini...');
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-
-    const parts: any[] = [];
-
-    // If existing image provided, add it for editing
     if (isEditing) {
       const base64Data = existingImage.split(',')[1];
-      const mimeType = existingImage.split(';')[0].split(':')[1];
-      parts.push({ inlineData: { data: base64Data, mimeType: mimeType } });
-    }
-
-    // Build prompt
-    let prompt = "";
-    if (isEditing) {
-      prompt = `TASK: Edit text on image. Replace Title with: "${title}". Replace Subtitle with: "${headline || ''}". Keep background/layout. USER OVERRIDES: "${instructions || ''}"`;
-    } else {
-      prompt = `Design book cover for "${title}". Headline: "${headline || ''}". STYLE: High-end corporate. USER INSTRUCTIONS: "${instructions || ''}"`;
-    }
-    parts.push({ text: prompt });
-    
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
-      contents: { parts: parts },
-      config: { 
-        responseModalities: ['TEXT', 'IMAGE'], 
-        imageConfig: { aspectRatio: '2:3', imageSize: '1K' } 
-      }
-    });
-    
-    if (response.candidates?.[0]?.content?.parts) {
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData && part.inlineData.data) {
-          console.log('AI cover generated successfully via Gemini');
-          return res.json({
-            imageData: `data:image/png;base64,${part.inlineData.data}`,
-            provider: 'gemini',
-            success: true
-          });
-        }
-      }
-    }
-    throw new Error('No image data in Gemini response');
-  } catch (geminiError: any) {
-    console.warn('Gemini cover gen failed, trying OpenAI fallback:', String(geminiError?.message || geminiError).slice(0, 200));
-
-    if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
-      return res.status(500).json({ error: 'Cover generation failed', details: geminiError?.message });
-    }
-
-    try {
-      // 2:3 portrait for book covers; OpenAI image gen handles that aspect.
-      const coverPrompt = isEditing
-        ? `Book cover design. Title: "${title}". Subtitle/headline: "${headline || ''}". STYLE: High-end corporate, premium, photoreal. ${instructions || ''}`
-        : `Design a high-end corporate book cover. Title: "${title}". Subtitle/headline: "${headline || ''}". Premium, photoreal, polished. ${instructions || ''}`;
-      const { b64, model } = await generateImageOpenAI(coverPrompt, '2:3');
-      console.log(`AI cover generated successfully via OpenAI ${model} (fallback from Gemini)`);
+      const mimeType = existingImage.split(';')[0].split(':')[1] || 'image/png';
+      const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
+      const { toFile } = await import('openai');
+      const imgFile = await toFile(Buffer.from(base64Data, 'base64'), `cover.${ext}`, { type: mimeType });
+      const resp = await (openai.images as any).edit({
+        model: OPENAI_IMAGE_MODEL,
+        image: imgFile,
+        prompt: `Edit the text on this book cover. Replace the title with: "${title}". Replace the subtitle with: "${headline || ''}". Keep the background, layout, and style unchanged. ${instructions || ''}`,
+        size: '1024x1536',
+      });
+      const b64 = resp?.data?.[0]?.b64_json;
+      if (!b64) throw new Error(`${OPENAI_IMAGE_MODEL} edit returned no image data`);
+      console.log(`Cover edited via ${OPENAI_IMAGE_MODEL}`);
       return res.json({
         imageData: `data:image/png;base64,${b64}`,
-        provider: `openai-${model}`,
+        provider: `openai-${OPENAI_IMAGE_MODEL}`,
         success: true,
-        fellBackFrom: 'gemini',
-      });
-    } catch (openaiError: any) {
-      console.error('OpenAI cover gen also failed:', String(openaiError?.message || openaiError).slice(0, 300));
-      return res.status(500).json({
-        error: 'Cover generation failed across all providers',
-        geminiError: String(geminiError?.message || geminiError).slice(0, 300),
-        openaiError: String(openaiError?.message || openaiError).slice(0, 300),
       });
     }
+
+    const coverPrompt = `Design a high-end corporate book cover. Title: "${title}". Subtitle/headline: "${headline || ''}". Premium, photoreal, polished. ${instructions || ''}`;
+    const { b64, model } = await generateImageOpenAI(coverPrompt, '2:3');
+    console.log(`Cover generated via ${model}`);
+    return res.json({
+      imageData: `data:image/png;base64,${b64}`,
+      provider: `openai-${model}`,
+      success: true,
+    });
+  } catch (err: any) {
+    console.error('Cover generation failed:', String(err?.message || err).slice(0, 300));
+    return res.status(500).json({
+      error: `Cover generation failed (${OPENAI_IMAGE_MODEL})`,
+      details: String(err?.message || err).slice(0, 300),
+    });
   }
 });
 
@@ -3648,108 +3530,63 @@ app.post("/api/ai/generate-metadata", requireRole("CREATOR"), async (req, res) =
     return { text: parsed.text ?? '' };
   };
 
-  // Try Gemini (which supports inline file + image in one call)
-  let geminiError: any = null;
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      console.log(`Generating ${target} (${mode}) with Gemini...`);
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const parts: any[] = [];
-      if (fileData && fileMimeType) parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
-      if (coverData) {
-        const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
-        parts.push({ inlineData: { data: base64, mimeType: 'image/png' } });
-      }
-      if (parts.length === 0 && mode === 'extract') {
-        return res.status(400).json({ error: "No file or cover data provided" });
-      }
-      parts.push({ text: promptInstr });
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: { parts },
-        config: { responseMimeType: "application/json" }
-      });
-
-      const json = JSON.parse(response.text || "{}");
-      console.log(`${target} generated successfully via Gemini`);
-      return res.json({ ...shapeResponse(json), provider: 'gemini', success: true });
-    } catch (err: any) {
-      geminiError = err;
-      console.warn(`Gemini ${target} gen failed, trying OpenAI:`, String(err?.message || err).slice(0, 200));
-    }
+  // Claude only — reads the cover image, PDFs, and images natively; DOCX is
+  // extracted via mammoth. No fallback — failures return the real error.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for metadata generation.' });
   }
-
-  // OpenAI fallback. Chat-completions vision accepts images directly; for PDFs
-  // we run pdf-parse server-side and pass the extracted text as plain context.
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
-    try {
-      const content: any[] = [{ type: 'text', text: promptInstr }];
-
-      // Cover image — vision-capable models read it directly.
-      if (coverData) {
-        const dataUrl = coverData.startsWith('data:') ? coverData : `data:image/png;base64,${coverData}`;
-        content.push({ type: 'image_url', image_url: { url: dataUrl } });
-      }
-
-      // Source file: images go in as image_url; PDFs and DOCX get text-extracted
-      // server-side first; text-like files get pasted directly.
-      if (fileData && fileMimeType) {
-        if (fileMimeType.startsWith('image/')) {
-          content.push({ type: 'image_url', image_url: { url: `data:${fileMimeType};base64,${fileData}` } });
-        } else if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
-          const buf = Buffer.from(fileData, 'base64');
-          const text = await extractPdfText(buf);
-          if (text) {
-            content.push({ type: 'text', text: `Source PDF text (first 8000 chars):\n\n${text}` });
-          } else {
-            content.unshift({ type: 'text', text: 'The user uploaded a PDF but text could not be extracted. Use the cover image (if any) and filename as context.' });
-          }
-        } else if (fileMimeType.includes('wordprocessingml') || /docx$/i.test(fileMimeType)) {
-          const buf = Buffer.from(fileData, 'base64');
-          const text = await extractDocxText(buf, 8000);
-          if (text) {
-            content.push({ type: 'text', text: `Source DOCX text:\n\n${text}` });
-          } else {
-            content.unshift({ type: 'text', text: 'The user uploaded a Word document but text could not be extracted.' });
-          }
-        } else if (fileMimeType === 'application/msword') {
-          content.unshift({ type: 'text', text: 'A legacy .doc (Word 97-2003) was uploaded. The fallback cannot read this format. Please ask the user to re-save as .docx, PDF, or TXT.' });
-        } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
-          // For TXT/MD: decode base64 to UTF-8 string.
-          try {
-            const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 8000);
-            content.push({ type: 'text', text: `Source file content:\n\n${decoded}` });
-          } catch {
-            // ignore
-          }
-        } else {
-          content.unshift({ type: 'text', text: `A file of type ${fileMimeType} was provided but cannot be read directly. Use any cover image and filename as context.` });
-        }
-      }
-
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content }],
-        response_format: { type: 'json_object' },
-        max_completion_tokens: target === 'all' ? 512 : 256,
-      });
-
-      const text = response.choices[0]?.message?.content || '{}';
-      const parsed = JSON.parse(text);
-      console.log(`${target} generated successfully via OpenAI (fallback)`);
-      return res.json({ ...shapeResponse(parsed), provider: 'openai', success: true, fellBackFrom: 'gemini' });
-    } catch (err: any) {
-      console.error(`OpenAI ${target} gen failed:`, String(err?.message || err).slice(0, 300));
-      return res.status(500).json({
-        error: 'Metadata generation failed across all providers',
-        geminiError: geminiError ? String(geminiError?.message || geminiError).slice(0, 300) : undefined,
-        openaiError: String(err?.message || err).slice(0, 300),
-      });
-    }
+  if (!fileData && !coverData && mode === 'extract') {
+    return res.status(400).json({ error: "No file or cover data provided" });
   }
+  try {
+    console.log(`Generating ${target} (${mode}) with Claude...`);
+    const content: any[] = [];
 
-  return res.status(500).json({ error: 'Metadata generation failed', details: String(geminiError?.message || geminiError) });
+    if (coverData) {
+      const base64 = coverData.includes(',') ? coverData.split(',')[1] : coverData;
+      const coverMime = coverData.startsWith('data:')
+        ? coverData.split(';')[0].split(':')[1] || 'image/png'
+        : 'image/png';
+      content.push({ type: 'image', source: { type: 'base64', media_type: coverMime, data: base64 } });
+    }
+
+    if (fileData && fileMimeType) {
+      if (fileMimeType.startsWith('image/')) {
+        content.push({ type: 'image', source: { type: 'base64', media_type: fileMimeType, data: fileData } });
+      } else if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
+        content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: fileData } });
+      } else if (fileMimeType.includes('wordprocessingml') || /docx$/i.test(fileMimeType)) {
+        const text = await extractDocxText(Buffer.from(fileData, 'base64'), 8000);
+        if (text) content.push({ type: 'text', text: `Source DOCX text:\n\n${text}` });
+      } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
+        try {
+          const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 8000);
+          content.push({ type: 'text', text: `Source file content:\n\n${decoded}` });
+        } catch { /* ignore decode failure */ }
+      }
+    }
+
+    content.push({ type: 'text', text: `${promptInstr}\n\nReturn ONLY valid JSON. No prose, no code fences.` });
+
+    const response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: target === 'all' ? 512 : 256,
+      messages: [{ role: 'user', content }],
+    });
+    const block = response.content.find((b) => b.type === 'text') as
+      | { type: 'text'; text: string }
+      | undefined;
+    const raw = (block?.text || '{}').replace(/```json/gi, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(raw);
+    console.log(`${target} generated successfully via Claude`);
+    return res.json({ ...shapeResponse(parsed), provider: 'claude', success: true });
+  } catch (err: any) {
+    console.error(`Claude ${target} gen failed:`, String(err?.message || err).slice(0, 300));
+    return res.status(500).json({
+      error: 'Metadata generation failed',
+      details: String(err?.message || err).slice(0, 300),
+    });
+  }
 });
 
 // Simple FLUX test endpoint - generates just 1 test image
@@ -3826,7 +3663,7 @@ app.post("/api/test-flux", requireRole("CREATOR"), async (req, res) => {
   }
 });
 
-// AI Text Generation with fallback
+// AI Text Generation — Claude only
 app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
   const { prompt, jsonMode = false, useOpenAI = false } = req.body;
   
@@ -3834,47 +3671,24 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
     return res.status(400).json({ error: "Prompt is required" });
   }
   
-  // Try Claude first (unless the caller explicitly requested OpenAI)
-  if (!useOpenAI && anthropic) {
-    try {
-      const finalPrompt = jsonMode
-        ? `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`
-        : prompt;
-      const text = await generateWithClaude({ prompt: finalPrompt, maxTokens: 4096 });
-      if (text) {
-        return res.json({ text, provider: 'claude', success: true });
-      }
-      throw new Error('No text in Claude response');
-    } catch (claudeErr: any) {
-      console.log('Claude text gen failed, trying OpenAI fallback:', claudeErr?.message);
-    }
+  // Claude only — no fallback. If it fails, the real error is returned.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for text generation.' });
   }
-
-  // OpenAI fallback
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
-    try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        response_format: jsonMode ? { type: "json_object" } : undefined,
-        max_completion_tokens: 4096,
-      });
-
-      const text = response.choices[0]?.message?.content;
-      if (text) {
-        return res.json({ text, provider: 'openai', success: true });
-      }
-      throw new Error('No text in OpenAI response');
-    } catch (openaiError: any) {
-      console.error('OpenAI text gen failed:', openaiError?.message);
-      return res.status(500).json({
-        error: 'Both Claude and OpenAI text generation failed',
-        details: openaiError?.message
-      });
-    }
+  try {
+    const finalPrompt = jsonMode
+      ? `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`
+      : prompt;
+    const text = await generateWithClaude({ prompt: finalPrompt, maxTokens: 4096 });
+    if (!text) throw new Error('No text in Claude response');
+    return res.json({ text, provider: 'claude', success: true });
+  } catch (claudeErr: any) {
+    console.error('Claude text gen failed:', claudeErr?.message);
+    return res.status(500).json({
+      error: 'Text generation failed',
+      details: String(claudeErr?.message || claudeErr).slice(0, 300),
+    });
   }
-
-  return res.status(500).json({ error: 'No AI provider available for text generation' });
 });
 
 // ============ MOTION VIDEO — AI SCENE DIRECTOR (2-STAGE PIPELINE) ============
@@ -3885,7 +3699,7 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
 //   Stage 2 — /api/ai/generate-scenes:  takes the FINISHED script, segments it
 //     into beats, fit-matches each beat to a template, writes on-screen copy.
 //
-// Both stages use the Claude -> OpenAI fallback.
+// Both stages run on Claude only — no fallback; failures return the real error.
 
 // ---- STAGE 1: SCRIPTWRITER ----
 // Reads source content (document text / crawled website / topic brief) and
@@ -3910,44 +3724,22 @@ app.post("/api/ai/generate-script", requireRole("CREATOR"), async (req, res) => 
       .replace(/^\s*(here(?:'s| is)|sure[,!]?|below is)[^\n:]*:?\s*/i, '')
       .trim();
 
-  // Try Claude first (the strong analyst for the motion pipeline).
-  let claudeErr = '';
-  if (anthropic) {
-    try {
-      const text = await generateWithClaude({ prompt, maxTokens: 4000 });
-      const script = cleanScript(text);
-      if (script.length >= 40) {
-        return res.json({ script, provider: 'claude', success: true });
-      }
-      throw new Error('Claude returned an empty script');
-    } catch (e: any) {
-      claudeErr = String(e?.message || e).slice(0, 200);
-      console.warn('Scriptwriter: Claude failed, trying OpenAI:', claudeErr);
-    }
+  // Claude only — no fallback. If it fails, the real error is returned.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for script generation.' });
   }
-
-  // OpenAI fallback — gpt-4o.
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
-    try {
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: prompt }],
-        max_completion_tokens: 4000,
-      });
-      const script = cleanScript(response.choices[0]?.message?.content || '');
-      if (script.length < 40) throw new Error('OpenAI returned an empty script');
-      return res.json({ script, provider: 'openai', success: true, fellBackFrom: 'claude' });
-    } catch (e: any) {
-      console.error('Scriptwriter: OpenAI failed:', String(e?.message || e).slice(0, 300));
-      return res.status(500).json({
-        error: 'Script generation failed across all providers',
-        claudeError: claudeErr || undefined,
-        openaiError: String(e?.message || e).slice(0, 300),
-      });
-    }
+  try {
+    const text = await generateWithClaude({ prompt, maxTokens: 4000 });
+    const script = cleanScript(text);
+    if (script.length < 40) throw new Error('Claude returned an empty script');
+    return res.json({ script, provider: 'claude', success: true });
+  } catch (e: any) {
+    console.error('Scriptwriter: Claude failed:', String(e?.message || e).slice(0, 300));
+    return res.status(500).json({
+      error: 'Script generation failed',
+      details: String(e?.message || e).slice(0, 300),
+    });
   }
-
-  return res.status(500).json({ error: 'No AI provider available', details: claudeErr });
 });
 
 // ---- STAGE 2: SCENE DIRECTOR ----
@@ -3981,44 +3773,22 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
   };
 
   // Try Gemini first.
-  let claudeErr = '';
-  if (anthropic) {
-    try {
-      const text = await generateWithClaude({ prompt, maxTokens: 8000 });
-      const scenes = parseScenes(text || '{}');
-      if (scenes.length > 0) {
-        return res.json({ scenes, provider: 'claude', success: true });
-      }
-      throw new Error('No usable scenes from Claude');
-    } catch (e: any) {
-      claudeErr = String(e?.message || e).slice(0, 200);
-      console.warn('Scene director: Claude failed, trying OpenAI:', claudeErr);
-    }
+  // Claude only — no fallback. If it fails, the real error is returned.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for scene generation.' });
   }
-
-  // OpenAI fallback — gpt-4o (strict JSON mode).
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
-    try {
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: prompt }],
-        response_format: { type: 'json_object' },
-        max_completion_tokens: 8000,
-      });
-      const scenes = parseScenes(response.choices[0]?.message?.content || '{}');
-      if (scenes.length === 0) throw new Error('No usable scenes from OpenAI');
-      return res.json({ scenes, provider: 'openai', success: true, fellBackFrom: 'claude' });
-    } catch (e: any) {
-      console.error('Scene director: OpenAI failed:', String(e?.message || e).slice(0, 300));
-      return res.status(500).json({
-        error: 'Scene generation failed across all providers',
-        claudeError: claudeErr || undefined,
-        openaiError: String(e?.message || e).slice(0, 300),
-      });
-    }
+  try {
+    const text = await generateWithClaude({ prompt, maxTokens: 8000 });
+    const scenes = parseScenes(text || '{}');
+    if (scenes.length === 0) throw new Error('No usable scenes from Claude');
+    return res.json({ scenes, provider: 'claude', success: true });
+  } catch (e: any) {
+    console.error('Scene director: Claude failed:', String(e?.message || e).slice(0, 300));
+    return res.status(500).json({
+      error: 'Scene generation failed',
+      details: String(e?.message || e).slice(0, 300),
+    });
   }
-
-  return res.status(500).json({ error: 'No AI provider available', details: claudeErr });
 });
 
 // ============ MOTION VIDEO — URL CONTENT EXTRACTION ============
@@ -4239,11 +4009,7 @@ app.post("/api/ai/extract-theme", requireRole("CREATOR"), async (req, res) => {
       return res.status(400).json({ error: 'Provide a url or PDF fileData' });
     }
 
-    // 2. Ask GPT-4o vision for the brand identity.
-    if (!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY)) {
-      return res.status(500).json({ error: 'No AI provider available for vision' });
-    }
-    const dataUrl = `data:${imgMime};base64,${imgBuf.toString('base64')}`;
+    // 2. Ask Claude vision for the brand identity.
     const visionPrompt = `You are a brand designer. Study this ${
       sourceKind === 'site' ? 'website screenshot' : 'document page'
     } and extract its visual brand identity. Return ONLY JSON in exactly this shape:
@@ -4261,38 +4027,17 @@ app.post("/api/ai/extract-theme", requireRole("CREATOR"), async (req, res) => {
 }
 Every colour MUST be a valid 6-digit hex. Use colours that genuinely appear in the design. If no red is present, choose a red that fits the palette. Pick the fontStyle closest to the headings in the design.`;
 
-    // Try Claude vision first, fall back to OpenAI gpt-4o vision.
+    // Claude vision only — no fallback.
+    if (!anthropic) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for theme extraction.' });
+    }
     const cleanJson = (t: string) =>
       t.replace(/```json/gi, '').replace(/```/g, '').trim();
-    let visionOut = '';
-    if (anthropic) {
-      try {
-        visionOut = await generateWithClaude({
-          prompt: visionPrompt,
-          maxTokens: 400,
-          images: [{ mediaType: imgMime, data: imgBuf.toString('base64') }],
-        });
-      } catch (e: any) {
-        console.warn('extract-theme: Claude vision failed, trying OpenAI:', String(e?.message || e).slice(0, 200));
-      }
-    }
-    if (!visionOut) {
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: visionPrompt },
-              { type: 'image_url', image_url: { url: dataUrl } },
-            ] as any,
-          },
-        ],
-        response_format: { type: 'json_object' },
-        max_completion_tokens: 400,
-      });
-      visionOut = response.choices[0]?.message?.content || '';
-    }
+    const visionOut = await generateWithClaude({
+      prompt: visionPrompt,
+      maxTokens: 400,
+      images: [{ mediaType: imgMime, data: imgBuf.toString('base64') }],
+    });
     const parsed = JSON.parse(cleanJson(visionOut) || '{}');
 
     // 3. Validate + assemble the theme. Invalid fields are dropped — the
@@ -4339,24 +4084,24 @@ Every colour MUST be a valid 6-digit hex. Use colours that genuinely appear in t
 });
 
 // ============ FILE-BEARING GENERATION (PDF/DOCX/TXT outlines + scripts) ============
-// Single endpoint used by CourseWizard's outline + script generators. Tries
-// Gemini (which can natively read PDF/DOCX), falls back to OpenAI with text
-// extracted server-side via pdf-parse (PDF) or direct base64 decode (TXT/MD).
+// Single endpoint used by CourseWizard's outline + script generators. Claude
+// reads PDF (document part), images (image parts), and text natively; DOCX is
+// extracted via mammoth first. No fallback — failures return the real error.
 app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) => {
   const { prompt, fileData, fileMimeType, jsonMode = false, maxTokens } = req.body;
 
   if (!prompt || typeof prompt !== 'string') {
     return res.status(400).json({ error: "Prompt is required" });
   }
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for file-bearing generation.' });
+  }
 
-  // Try Claude first — it reads PDF (as a document part), images (as image
-  // parts), and text natively. DOCX still needs mammoth extraction. jsonMode
-  // is enforced via a strong "return only JSON" instruction (Claude doesn't
-  // have a strict json_object switch like OpenAI).
-  let claudeError: any = null;
-  if (anthropic) {
+  // jsonMode is enforced via a strong "return only JSON" instruction (Claude
+  // doesn't have a strict json_object switch like OpenAI).
+  {
     try {
-      console.log(`generate-from-file: trying Claude${fileMimeType ? ` (file: ${fileMimeType})` : ''}...`);
+      console.log(`generate-from-file: Claude${fileMimeType ? ` (file: ${fileMimeType})` : ''}...`);
       const content: any[] = [];
       if (fileData && fileMimeType) {
         if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
@@ -4407,81 +4152,13 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
       }
       throw new Error('No text in Claude response');
     } catch (err: any) {
-      claudeError = err;
-      console.warn('generate-from-file: Claude failed, trying OpenAI:', String(err?.message || err).slice(0, 200));
-    }
-  }
-
-  // OpenAI fallback. Chat-completions vision doesn't accept PDF/DOCX binaries;
-  // we extract text first and embed it in the prompt.
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
-    try {
-      let augmentedPrompt = prompt;
-
-      if (fileData && fileMimeType) {
-        if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
-          const buf = Buffer.from(fileData, 'base64');
-          // For full-document tasks (outline, script generation) we want more text
-          // than the metadata path uses. 60k chars ≈ 12-15k tokens, leaving room
-          // for the prompt + JSON response within gpt-4o-mini's 128k context.
-          const extracted = await extractPdfText(buf, 60000);
-          if (extracted) {
-            augmentedPrompt = `${prompt}\n\n---\nSOURCE PDF CONTENT (extracted text, may be truncated):\n${extracted}`;
-          } else {
-            augmentedPrompt = `${prompt}\n\n---\nNote: A PDF was provided but text extraction failed (possibly scanned/image-only PDF). Proceed using the prompt context alone.`;
-          }
-        } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
-          try {
-            const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 60000);
-            augmentedPrompt = `${prompt}\n\n---\nSOURCE FILE CONTENT:\n${decoded}`;
-          } catch {
-            augmentedPrompt = `${prompt}\n\n---\nNote: A text file was provided but could not be decoded.`;
-          }
-        } else if (fileMimeType.includes('wordprocessingml') || /docx$/i.test(fileMimeType) || fileMimeType === 'application/msword') {
-          // Modern .docx is extractable via mammoth. Older .doc (binary, pre-2007)
-          // is not supported by mammoth — note the limitation.
-          if (fileMimeType === 'application/msword') {
-            augmentedPrompt = `${prompt}\n\n---\nNote: A legacy .doc (Word 97-2003) file was provided. Please re-save as .docx, PDF, or TXT for full text extraction support.`;
-          } else {
-            const buf = Buffer.from(fileData, 'base64');
-            const extracted = await extractDocxText(buf, 60000);
-            if (extracted) {
-              augmentedPrompt = `${prompt}\n\n---\nSOURCE DOCX CONTENT (extracted text, may be truncated):\n${extracted}`;
-            } else {
-              augmentedPrompt = `${prompt}\n\n---\nNote: A Word document was provided but text extraction failed. Proceed using the prompt context alone.`;
-            }
-          }
-        } else if (fileMimeType.startsWith('image/')) {
-          // For images, we'd want to use vision — but outline/script use cases here
-          // are text-based. Note it and proceed without.
-          augmentedPrompt = `${prompt}\n\n---\nNote: An image was provided. Proceed using the prompt context.`;
-        } else {
-          augmentedPrompt = `${prompt}\n\n---\nNote: A file of type ${fileMimeType} was provided but cannot be read by the fallback provider.`;
-        }
-      }
-
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: augmentedPrompt }],
-        response_format: jsonMode ? { type: 'json_object' } : undefined,
-        max_completion_tokens: maxTokens || 4096,
-      });
-
-      const text = response.choices[0]?.message?.content;
-      if (!text) throw new Error('No text in OpenAI response');
-      console.log('generate-from-file: OpenAI fallback success');
-      return res.json({ text, provider: 'openai', success: true, fellBackFrom: 'claude' });
-    } catch (err: any) {
-      console.error('generate-from-file: OpenAI failed:', String(err?.message || err).slice(0, 300));
+      console.error('generate-from-file: Claude failed:', String(err?.message || err).slice(0, 300));
       return res.status(500).json({
-        error: 'File-bearing generation failed across all providers',
-        claudeError: claudeError ? String(claudeError?.message || claudeError).slice(0, 300) : undefined,
-        openaiError: String(err?.message || err).slice(0, 300),
+        error: 'File-bearing generation failed',
+        details: String(err?.message || err).slice(0, 300),
       });
     }
   }
-
-  return res.status(500).json({ error: 'No AI provider available', details: String(claudeError?.message || claudeError) });
 });
 
 // ============ TAKEAWAYS GENERATION ============
@@ -4510,61 +4187,29 @@ Respond in this exact JSON format:
 
 Keep each item concise (under 100 characters). Focus on practical value.`;
 
-  // Try Gemini first
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ parts: [{ text: prompt }] }],
-        config: { responseMimeType: 'application/json' }
-      });
-      
-      const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) {
-        try {
-          const parsed = JSON.parse(text);
-          return res.json({
-            keyTakeaways: parsed.keyTakeaways || [],
-            actionItems: parsed.actionItems || [],
-            provider: 'gemini',
-            success: true
-          });
-        } catch (parseError) {
-          console.error('Failed to parse Gemini takeaways response:', text);
-        }
-      }
-    } catch (geminiError: any) {
-      console.log('Gemini takeaways failed, trying OpenAI:', geminiError?.message);
-    }
+  // Claude only — no fallback.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for takeaways generation.' });
   }
-  
-  // OpenAI fallback
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
-    try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-        max_completion_tokens: 1024,
-      });
-      
-      const text = response.choices[0]?.message?.content;
-      if (text) {
-        const parsed = JSON.parse(text);
-        return res.json({
-          keyTakeaways: parsed.keyTakeaways || [],
-          actionItems: parsed.actionItems || [],
-          provider: 'openai',
-          success: true
-        });
-      }
-    } catch (openaiError: any) {
-      console.error('OpenAI takeaways failed:', openaiError?.message);
-    }
+  try {
+    const text = await generateWithClaude({
+      prompt: `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`,
+      maxTokens: 1024,
+    });
+    const parsed = JSON.parse(text.replace(/```json/gi, '').replace(/```/g, '').trim());
+    return res.json({
+      keyTakeaways: parsed.keyTakeaways || [],
+      actionItems: parsed.actionItems || [],
+      provider: 'claude',
+      success: true
+    });
+  } catch (err: any) {
+    console.error('Claude takeaways failed:', err?.message);
+    return res.status(500).json({
+      error: 'Takeaways generation failed',
+      details: String(err?.message || err).slice(0, 300),
+    });
   }
-  
-  return res.status(500).json({ error: 'Failed to generate takeaways - no AI provider available' });
 });
 
 // ============ RESUME PARSING ============
@@ -4592,74 +4237,27 @@ ${resumeText}
 Return ONLY valid JSON in this exact format, no other text:
 {"firstName": "", "lastName": "", "email": "", "phone": "", "city": "", "state": ""}`;
 
-  // Try Gemini first
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ parts: [{ text: prompt }] }],
-        config: { responseMimeType: 'application/json' }
-      });
-      
-      const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) {
-        try {
-          const parsed = JSON.parse(text);
-          // Generate password: lastName + last 4 digits of phone
-          const phoneDigits = (parsed.phone || '').replace(/\D/g, '');
-          const last4 = phoneDigits.slice(-4) || '1234';
-          const lastName = parsed.lastName || 'Student';
-          parsed.generatedPassword = lastName.toLowerCase() + last4;
-          
-          return res.json({ ...parsed, provider: 'gemini', success: true });
-        } catch (parseError) {
-          console.log('Failed to parse Gemini JSON response:', text);
-          throw new Error('Invalid JSON from Gemini');
-        }
-      }
-      throw new Error('No text in Gemini response');
-    } catch (geminiError: any) {
-      console.log('Gemini resume parsing failed, trying OpenAI fallback:', geminiError?.message);
-    }
+  // Claude only — no fallback.
+  if (!anthropic) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is required for resume parsing.' });
   }
-  
-  // OpenAI fallback
-  if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
-    try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-        max_completion_tokens: 1024,
-      });
-      
-      const text = response.choices[0]?.message?.content;
-      if (text) {
-        try {
-          const parsed = JSON.parse(text);
-          // Generate password: lastName + last 4 digits of phone
-          const phoneDigits = (parsed.phone || '').replace(/\D/g, '');
-          const last4 = phoneDigits.slice(-4) || '1234';
-          const lastName = parsed.lastName || 'Student';
-          parsed.generatedPassword = lastName.toLowerCase() + last4;
-          
-          return res.json({ ...parsed, provider: 'openai', success: true });
-        } catch (parseError) {
-          throw new Error('Invalid JSON from OpenAI');
-        }
-      }
-      throw new Error('No text in OpenAI response');
-    } catch (openaiError: any) {
-      console.error('OpenAI resume parsing failed:', openaiError?.message);
-      return res.status(500).json({ 
-        error: 'Both Gemini and OpenAI resume parsing failed', 
-        details: openaiError?.message 
-      });
-    }
+  try {
+    const text = await generateWithClaude({ prompt, maxTokens: 1024 });
+    const parsed = JSON.parse(text.replace(/```json/gi, '').replace(/```/g, '').trim());
+    // Generate password: lastName + last 4 digits of phone
+    const phoneDigits = (parsed.phone || '').replace(/\D/g, '');
+    const last4 = phoneDigits.slice(-4) || '1234';
+    const lastName = parsed.lastName || 'Student';
+    parsed.generatedPassword = lastName.toLowerCase() + last4;
+
+    return res.json({ ...parsed, provider: 'claude', success: true });
+  } catch (err: any) {
+    console.error('Claude resume parsing failed:', err?.message);
+    return res.status(500).json({
+      error: 'Resume parsing failed',
+      details: String(err?.message || err).slice(0, 300),
+    });
   }
-  
-  return res.status(500).json({ error: 'No AI provider available for resume parsing' });
 });
 
 // ============ HEALTH CHECK ============
