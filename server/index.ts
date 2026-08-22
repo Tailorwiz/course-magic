@@ -21,7 +21,7 @@ import { eq, and, sql } from "drizzle-orm";
 import { ObjectStorageService, ObjectNotFoundError, objectStorageClient } from "./objectStorage";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { signToken, requireAuth, requireAuthMedia, requireRole, requireSelfOrRole } from "./auth";
-import { enqueueMotionRender, getMotionJob, isRenderBusy } from "./motion";
+import { enqueueMotionRender, getMotionJob, isRenderBusy, synthesizeKokoroSingle } from "./motion";
 import { buildScriptPrompt, buildDirectorPrompt, sanitizeScenes } from "./sceneDirector";
 import archiver from "archiver";
 import os from "os";
@@ -67,19 +67,11 @@ app.use("/media", express.static(mediaPath, {
   immutable: true
 }));
 
-// Serve objects from Replit Object Storage (handles paths like /objects/videos/abc.mp4)
-app.get(/^\/objects\/(.+)$/, async (req, res) => {
-  try {
-    const objectStorageService = new ObjectStorageService();
-    const objectFile = await objectStorageService.getObjectEntityFile(req.path);
-    objectStorageService.downloadObject(objectFile, res);
-  } catch (error) {
-    if (error instanceof ObjectNotFoundError) {
-      return res.sendStatus(404);
-    }
-    console.error("Error serving object:", error);
-    return res.sendStatus(500);
-  }
+// Legacy /objects/* paths (Replit Object Storage era). That storage backend
+// is gone — media lives in the database now — so old records that still
+// reference /objects/ URLs get an honest 404 instead of a crash/500.
+app.get(/^\/objects\/(.+)$/, (_req, res) => {
+  res.sendStatus(404);
 });
 
 // ============ MEDIA HELPERS ============
@@ -146,44 +138,6 @@ async function isObjectStorageConfigured(): Promise<boolean> {
   // DISABLED: Only use Supabase database for all storage
   // Object Storage is not used - all media goes to lesson_audio and lesson_images tables
   return false;
-  
-  if (!process.env.PRIVATE_OBJECT_DIR) return false;
-  
-  // Cache the result after first check
-  if (objectStorageWorking !== null) return objectStorageWorking;
-  
-  // Test if Object Storage actually works by trying to list bucket
-  try {
-    const objectStorageService = new ObjectStorageService();
-    const privateDir = objectStorageService.getPrivateObjectDir();
-    console.log('Object Storage: Testing with PRIVATE_OBJECT_DIR =', privateDir);
-    const { bucketName, objectName } = parseObjectPath(privateDir);
-    console.log('Object Storage: Parsed bucket =', bucketName, ', path =', objectName);
-    
-    // Try to access the bucket to verify permissions
-    const bucket = objectStorageClient.bucket(bucketName);
-    await bucket.getMetadata();
-    
-    objectStorageWorking = true;
-    console.log('Object Storage status: WORKING (bucket accessible)');
-  } catch (err: any) {
-    objectStorageWorking = false;
-    console.log('Object Storage error details:', JSON.stringify({
-      message: err.message,
-      code: err.code,
-      name: err.name,
-      status: err.status,
-      errors: err.errors
-    }, null, 2));
-    if (err.message?.includes('no allowed resources')) {
-      console.log('Object Storage status: NOT CONFIGURED (bucket not in allowed resources)');
-      console.log('HINT: Add the bucket to allowed resources in the Object Storage panel');
-    } else {
-      console.log('Object Storage status: NOT AVAILABLE -', err.message || String(err));
-    }
-  }
-  
-  return objectStorageWorking;
 }
 
 function parseObjectPath(path: string): { bucketName: string; objectName: string } {
@@ -326,82 +280,73 @@ async function extractMediaFromCourse(course: any): Promise<any> {
 
 // ============ TTS API ROUTES ============
 
-const GEMINI_VOICE_MAP: Record<string, string> = {
-  'Fenrir (Deep Male)': 'Fenrir',
-  'Puck (Tenor Male)': 'Puck',
-  'Charon (Deep Male)': 'Charon',
-  'Kore (Balanced Female)': 'Kore',
-  'Zephyr (Bright Female)': 'Zephyr'
+// Voice names the classic video/course UIs use, mapped to Kokoro voices.
+// Gemini TTS is retired (blocked API key) — Kokoro is the free, self-hosted
+// engine already powering motion-video narration. Kokoro voice ids also pass
+// straight through (af_heart, am_onyx, …).
+const KOKORO_VOICE_MAP: Record<string, string> = {
+  'Fenrir (Deep Male)': 'am_onyx',
+  'Puck (Tenor Male)': 'am_echo',
+  'Charon (Deep Male)': 'am_adam',
+  'Kore (Balanced Female)': 'af_nova',
+  'Zephyr (Bright Female)': 'af_bella',
 };
 
-// Gemini TTS endpoint - proxies requests to keep API key secure
-app.post("/api/tts/gemini", requireAuth, async (req, res) => {
+// TTS endpoint for course/training-video voiceovers — Kokoro, self-hosted,
+// free, no external API. Kept at the /api/tts/gemini route so existing
+// clients keep working; /api/tts/kokoro is the same handler's canonical name.
+/**
+ * Extract raw PCM16 samples from a RIFF/WAV buffer by locating its `data`
+ * chunk, resampling metadata is returned alongside. Kokoro writes standard
+ * PCM16 mono WAVs (24 kHz), which is exactly the 'audio/pcm' format every
+ * existing client/player in the app already handles — so we strip the WAV
+ * container here and the old contract holds end to end.
+ */
+function wavToPcm(buf: Buffer): { pcm: Buffer; sampleRate: number } {
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') {
+    throw new Error('Not a RIFF/WAV file');
+  }
+  const sampleRate = buf.readUInt32LE(24);
+  let offset = 12;
+  while (offset + 8 <= buf.length) {
+    const chunkId = buf.toString('ascii', offset, offset + 4);
+    const chunkSize = buf.readUInt32LE(offset + 4);
+    if (chunkId === 'data') {
+      return { pcm: buf.subarray(offset + 8, offset + 8 + chunkSize), sampleRate };
+    }
+    offset += 8 + chunkSize + (chunkSize % 2);
+  }
+  throw new Error('WAV data chunk not found');
+}
+
+const kokoroTtsHandler = async (req: any, res: any) => {
   try {
-    const { text, voiceId } = req.body;
-    
+    const { text, voiceId, speed } = req.body;
     if (!text || !voiceId) {
       return res.status(400).json({ error: "Missing text or voiceId" });
     }
-    
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.error("GEMINI_API_KEY not configured on server");
-      return res.status(500).json({ error: "TTS service not configured" });
-    }
-    
-    const ai = new GoogleGenAI({ apiKey });
-    const modelName = GEMINI_VOICE_MAP[voiceId] || 'Kore';
-    
-    console.log(`Gemini TTS request: voice=${modelName}, text length=${text.length}`);
-    
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: modelName }
-          }
-        }
-      }
+    const voice = KOKORO_VOICE_MAP[String(voiceId)] || (/^[ab][fm]_/.test(String(voiceId)) ? String(voiceId) : 'af_heart');
+    console.log(`Kokoro TTS request: voice=${voice}, text length=${String(text).length}`);
+    const { audioBase64, durationSec } = await synthesizeKokoroSingle(
+      String(text),
+      voice,
+      typeof speed === 'number' && speed > 0 ? speed : 1.0,
+    );
+    const { pcm, sampleRate } = wavToPcm(Buffer.from(audioBase64, 'base64'));
+    return res.json({
+      audioData: pcm.toString('base64'),
+      mimeType: 'audio/pcm',
+      sampleRate,
+      duration: durationSec,
+      success: true,
     });
-    
-    if (response.candidates?.[0]?.content?.parts) {
-      let audioData = '';
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData && part.inlineData.data) {
-          audioData = part.inlineData.data;
-          break;
-        }
-      }
-      
-      if (audioData) {
-        console.log(`Gemini TTS success: audio data length=${audioData.length}`);
-        return res.json({ 
-          audioData, 
-          mimeType: 'audio/pcm',
-          success: true 
-        });
-      }
-    }
-    
-    console.error("Gemini TTS returned no audio data");
-    return res.status(500).json({ error: "TTS returned no audio data" });
-    
   } catch (error: any) {
-    console.error("Gemini TTS error:", error.message || error);
-    
-    if (error.message?.includes('429') || error.message?.includes('quota')) {
-      return res.status(429).json({ error: "Rate limit reached. Please wait and try again." });
-    }
-    if (error.message?.includes('401') || error.message?.includes('403')) {
-      return res.status(401).json({ error: "API key issue. Please check server configuration." });
-    }
-    
-    return res.status(500).json({ error: error.message || "TTS generation failed" });
+    console.error("Kokoro TTS error:", error?.message || error);
+    return res.status(500).json({ error: error?.message || "TTS generation failed" });
   }
-});
+};
+app.post("/api/tts/gemini", requireAuth, kokoroTtsHandler);
+app.post("/api/tts/kokoro", requireAuth, kokoroTtsHandler);
 
 // ElevenLabs TTS endpoint - proxies requests to keep API key secure
 app.post("/api/tts/elevenlabs", requireAuth, async (req, res) => {
@@ -3850,12 +3795,25 @@ const URL_EXTRACT_MAX_CHARS = 45000;
 const KEY_PAGE_KEYWORDS =
   /(about|pricing|price|plans?|product|features?|services?|solutions?|how-?it-?works|what-we-do|benefits?|overview)/i;
 
-/** Fetch one page's clean, JS-rendered content via Jina AI Reader. */
+/** Fetch one page's clean, JS-rendered content via Jina AI Reader.
+ *  Jina now requires an API key (free at https://jina.ai) — set JINA_API_KEY. */
 async function fetchViaJina(pageUrl: string): Promise<string> {
+  const headers: Record<string, string> = {
+    'User-Agent': 'CourseMagic',
+    'X-Return-Format': 'markdown',
+  };
+  if (process.env.JINA_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.JINA_API_KEY}`;
+  }
   const r = await fetch(`https://r.jina.ai/${pageUrl}`, {
-    headers: { 'User-Agent': 'CourseMagic', 'X-Return-Format': 'markdown' },
+    headers,
     signal: AbortSignal.timeout(35000),
   });
+  if (r.status === 401 && !process.env.JINA_API_KEY) {
+    throw new Error(
+      'Website reading requires a JINA_API_KEY. Get a free key at jina.ai and add it to the server environment.',
+    );
+  }
   if (!r.ok) throw new Error(`Reader returned HTTP ${r.status}`);
   return (await r.text()).trim();
 }

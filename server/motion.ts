@@ -172,6 +172,37 @@ function synthesizeKokoroBatch(
   });
 }
 
+/**
+ * Synthesize ONE piece of narration with Kokoro and return the WAV as a
+ * base64 string plus its duration. Used by the /api/tts/kokoro endpoint that
+ * powers course/training-video voiceovers (Gemini TTS is retired).
+ */
+export async function synthesizeKokoroSingle(
+  text: string,
+  voice: string,
+  speed = 1.0,
+): Promise<{ audioBase64: string; durationSec: number }> {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoro-single-'));
+  try {
+    const results = await synthesizeKokoroBatch(
+      [{ id: 'seg', text }],
+      voice || DEFAULT_TTS_VOICE,
+      speed,
+      outDir,
+    );
+    const r = results[0];
+    if (!r?.wavPath) throw new Error('Kokoro produced no audio');
+    const audioBase64 = fs.readFileSync(r.wavPath).toString('base64');
+    return { audioBase64, durationSec: r.durationSec };
+  } finally {
+    try {
+      fs.rmSync(outDir, { recursive: true, force: true });
+    } catch {
+      /* ignore temp cleanup errors */
+    }
+  }
+}
+
 // ----- Render jobs ----------------------------------------------------------
 
 export type MotionJobStatus = 'queued' | 'tts' | 'rendering' | 'done' | 'error';
