@@ -2300,6 +2300,52 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
+// Cross-service student provisioning — used by the unified quick-add portal in the
+// TailorWiz admin. Protected by a shared secret header so external services can
+// create a student (with course access) without a CREATOR session. Idempotent:
+// if the email already exists, it merges the requested courses onto that student.
+app.post("/api/admin/provision-student", async (req, res) => {
+  try {
+    const provided = req.headers["x-provision-secret"];
+    const expected = process.env.PROVISION_SECRET;
+    if (!expected || provided !== expected) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { name, email, password, phone, city, state, assignedCourseIds } = req.body || {};
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: "name, email, and password are required" });
+    }
+    const courseIds: string[] = Array.isArray(assignedCourseIds) ? assignedCourseIds : [];
+
+    const existing = await db.select().from(users).where(eq(users.email, email));
+    if (existing.length > 0) {
+      const u = existing[0];
+      const merged = Array.from(new Set([...(u.assignedCourseIds || []), ...courseIds]));
+      await db.update(users).set({ assignedCourseIds: merged }).where(eq(users.id, u.id));
+      return res.json({ success: true, created: false, userId: u.id, assignedCourseIds: merged });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const [newUser] = await db.insert(users).values({
+      name,
+      email,
+      password: hashedPassword,
+      role: "STUDENT",
+      avatarUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`,
+      phone,
+      city,
+      state,
+      assignedCourseIds: courseIds,
+    }).returning();
+
+    return res.json({ success: true, created: true, userId: newUser.id, assignedCourseIds: courseIds });
+  } catch (error) {
+    console.error("provision-student error:", error);
+    return res.status(500).json({ error: "Provisioning failed" });
+  }
+});
+
 // Lookup current user from token — useful for client to validate session on reload
 app.get("/api/auth/me", requireAuth, async (req, res) => {
   const auth = (req as any).auth;
@@ -3231,6 +3277,7 @@ app.get("/api/migrate-media/pending", requireRole("CREATOR"), async (req, res) =
 // ============ AI IMAGE GENERATION WITH FALLBACK ============
 
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import Replicate from "replicate";
 
 // Normalize the OpenAI base URL — OpenAI SDK requires the `/v1` suffix. Some env
@@ -3252,6 +3299,50 @@ const openai = new OpenAI({
   apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY,
   baseURL: normalizeOpenAIBaseURL(process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) || undefined,
 });
+
+// Claude — the primary text/vision model for the motion-video pipeline
+// (script writing, scene direction, theme extraction, document analysis).
+// OpenAI (gpt-4o) is the automatic fallback; image generation stays on OpenAI.
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+const CLAUDE_MODEL = 'claude-sonnet-5';
+
+/**
+ * Call Claude for a text/JSON generation. Returns the raw text (which callers
+ * strip of code fences and parse if they want JSON). Throws on any error so
+ * the endpoint's OpenAI-fallback path can kick in.
+ *
+ * `images`: optional array of { mediaType, data } base64 image parts for
+ * vision inputs. `system`: optional system prompt.
+ */
+async function generateWithClaude(opts: {
+  prompt: string;
+  maxTokens?: number;
+  system?: string;
+  images?: { mediaType: string; data: string }[];
+}): Promise<string> {
+  if (!anthropic) throw new Error('ANTHROPIC_API_KEY not set');
+  const content: any[] = [];
+  for (const img of opts.images || []) {
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: img.mediaType, data: img.data },
+    });
+  }
+  content.push({ type: 'text', text: opts.prompt });
+
+  const response = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: opts.maxTokens || 4000,
+    system: opts.system,
+    messages: [{ role: 'user', content }],
+  });
+  const block = response.content.find((b) => b.type === 'text') as
+    | { type: 'text'; text: string }
+    | undefined;
+  return block?.text || '';
+}
 
 // Fallback image generator via OpenAI. Tries gpt-image-1 first (newer, photoreal,
 // closer to Gemini's look), falls back to DALL-E 3 if the org isn't verified for
@@ -3743,31 +3834,22 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
     return res.status(400).json({ error: "Prompt is required" });
   }
   
-  // Try Gemini first
-  if (!useOpenAI && process.env.GEMINI_API_KEY) {
+  // Try Claude first (unless the caller explicitly requested OpenAI)
+  if (!useOpenAI && anthropic) {
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const config: any = {};
-      if (jsonMode) {
-        config.responseMimeType = 'application/json';
-      }
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ parts: [{ text: prompt }] }],
-        config
-      });
-      
-      const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
+      const finalPrompt = jsonMode
+        ? `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`
+        : prompt;
+      const text = await generateWithClaude({ prompt: finalPrompt, maxTokens: 4096 });
       if (text) {
-        return res.json({ text, provider: 'gemini', success: true });
+        return res.json({ text, provider: 'claude', success: true });
       }
-      throw new Error('No text in Gemini response');
-    } catch (geminiError: any) {
-      console.log('Gemini text gen failed, trying OpenAI fallback:', geminiError?.message);
+      throw new Error('No text in Claude response');
+    } catch (claudeErr: any) {
+      console.log('Claude text gen failed, trying OpenAI fallback:', claudeErr?.message);
     }
   }
-  
+
   // OpenAI fallback
   if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
     try {
@@ -3777,7 +3859,7 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
         response_format: jsonMode ? { type: "json_object" } : undefined,
         max_completion_tokens: 4096,
       });
-      
+
       const text = response.choices[0]?.message?.content;
       if (text) {
         return res.json({ text, provider: 'openai', success: true });
@@ -3785,13 +3867,13 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
       throw new Error('No text in OpenAI response');
     } catch (openaiError: any) {
       console.error('OpenAI text gen failed:', openaiError?.message);
-      return res.status(500).json({ 
-        error: 'Both Gemini and OpenAI text generation failed', 
-        details: openaiError?.message 
+      return res.status(500).json({
+        error: 'Both Claude and OpenAI text generation failed',
+        details: openaiError?.message
       });
     }
   }
-  
+
   return res.status(500).json({ error: 'No AI provider available for text generation' });
 });
 
@@ -3803,7 +3885,7 @@ app.post("/api/ai/generate-text", requireRole("CREATOR"), async (req, res) => {
 //   Stage 2 — /api/ai/generate-scenes:  takes the FINISHED script, segments it
 //     into beats, fit-matches each beat to a template, writes on-screen copy.
 //
-// Both stages use the Gemini -> OpenAI fallback.
+// Both stages use the Claude -> OpenAI fallback.
 
 // ---- STAGE 1: SCRIPTWRITER ----
 // Reads source content (document text / crawled website / topic brief) and
@@ -3828,28 +3910,23 @@ app.post("/api/ai/generate-script", requireRole("CREATOR"), async (req, res) => 
       .replace(/^\s*(here(?:'s| is)|sure[,!]?|below is)[^\n:]*:?\s*/i, '')
       .trim();
 
-  // Try Gemini first.
-  let geminiErr = '';
-  if (process.env.GEMINI_API_KEY) {
+  // Try Claude first (the strong analyst for the motion pipeline).
+  let claudeErr = '';
+  if (anthropic) {
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ parts: [{ text: prompt }] }],
-      });
-      const text = response.candidates?.[0]?.content?.parts?.[0]?.text || response.text;
-      const script = cleanScript(text || '');
+      const text = await generateWithClaude({ prompt, maxTokens: 4000 });
+      const script = cleanScript(text);
       if (script.length >= 40) {
-        return res.json({ script, provider: 'gemini', success: true });
+        return res.json({ script, provider: 'claude', success: true });
       }
-      throw new Error('Gemini returned an empty script');
+      throw new Error('Claude returned an empty script');
     } catch (e: any) {
-      geminiErr = String(e?.message || e).slice(0, 200);
-      console.warn('Scriptwriter: Gemini failed, trying OpenAI:', geminiErr);
+      claudeErr = String(e?.message || e).slice(0, 200);
+      console.warn('Scriptwriter: Claude failed, trying OpenAI:', claudeErr);
     }
   }
 
-  // OpenAI fallback — gpt-4o (the strong model) for thorough content analysis.
+  // OpenAI fallback — gpt-4o.
   if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
     try {
       const response = await openai.chat.completions.create({
@@ -3859,18 +3936,18 @@ app.post("/api/ai/generate-script", requireRole("CREATOR"), async (req, res) => 
       });
       const script = cleanScript(response.choices[0]?.message?.content || '');
       if (script.length < 40) throw new Error('OpenAI returned an empty script');
-      return res.json({ script, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+      return res.json({ script, provider: 'openai', success: true, fellBackFrom: 'claude' });
     } catch (e: any) {
       console.error('Scriptwriter: OpenAI failed:', String(e?.message || e).slice(0, 300));
       return res.status(500).json({
         error: 'Script generation failed across all providers',
-        geminiError: geminiErr || undefined,
+        claudeError: claudeErr || undefined,
         openaiError: String(e?.message || e).slice(0, 300),
       });
     }
   }
 
-  return res.status(500).json({ error: 'No AI provider available', details: geminiErr });
+  return res.status(500).json({ error: 'No AI provider available', details: claudeErr });
 });
 
 // ---- STAGE 2: SCENE DIRECTOR ----
@@ -3904,28 +3981,22 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
   };
 
   // Try Gemini first.
-  let geminiErr = '';
-  if (process.env.GEMINI_API_KEY) {
+  let claudeErr = '';
+  if (anthropic) {
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [{ parts: [{ text: prompt }] }],
-        config: { responseMimeType: 'application/json' },
-      });
-      const text = response.candidates?.[0]?.content?.parts?.[0]?.text || response.text;
+      const text = await generateWithClaude({ prompt, maxTokens: 8000 });
       const scenes = parseScenes(text || '{}');
       if (scenes.length > 0) {
-        return res.json({ scenes, provider: 'gemini', success: true });
+        return res.json({ scenes, provider: 'claude', success: true });
       }
-      throw new Error('No usable scenes from Gemini');
+      throw new Error('No usable scenes from Claude');
     } catch (e: any) {
-      geminiErr = String(e?.message || e).slice(0, 200);
-      console.warn('Scene director: Gemini failed, trying OpenAI:', geminiErr);
+      claudeErr = String(e?.message || e).slice(0, 200);
+      console.warn('Scene director: Claude failed, trying OpenAI:', claudeErr);
     }
   }
 
-  // OpenAI fallback — gpt-4o (the strong model) for thorough content analysis.
+  // OpenAI fallback — gpt-4o (strict JSON mode).
   if (process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
     try {
       const response = await openai.chat.completions.create({
@@ -3936,18 +4007,18 @@ app.post("/api/ai/generate-scenes", requireRole("CREATOR"), async (req, res) => 
       });
       const scenes = parseScenes(response.choices[0]?.message?.content || '{}');
       if (scenes.length === 0) throw new Error('No usable scenes from OpenAI');
-      return res.json({ scenes, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+      return res.json({ scenes, provider: 'openai', success: true, fellBackFrom: 'claude' });
     } catch (e: any) {
       console.error('Scene director: OpenAI failed:', String(e?.message || e).slice(0, 300));
       return res.status(500).json({
         error: 'Scene generation failed across all providers',
-        geminiError: geminiErr || undefined,
+        claudeError: claudeErr || undefined,
         openaiError: String(e?.message || e).slice(0, 300),
       });
     }
   }
 
-  return res.status(500).json({ error: 'No AI provider available', details: geminiErr });
+  return res.status(500).json({ error: 'No AI provider available', details: claudeErr });
 });
 
 // ============ MOTION VIDEO — URL CONTENT EXTRACTION ============
@@ -4190,21 +4261,39 @@ app.post("/api/ai/extract-theme", requireRole("CREATOR"), async (req, res) => {
 }
 Every colour MUST be a valid 6-digit hex. Use colours that genuinely appear in the design. If no red is present, choose a red that fits the palette. Pick the fontStyle closest to the headings in the design.`;
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: visionPrompt },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ] as any,
-        },
-      ],
-      response_format: { type: 'json_object' },
-      max_completion_tokens: 400,
-    });
-    const parsed = JSON.parse(response.choices[0]?.message?.content || '{}');
+    // Try Claude vision first, fall back to OpenAI gpt-4o vision.
+    const cleanJson = (t: string) =>
+      t.replace(/```json/gi, '').replace(/```/g, '').trim();
+    let visionOut = '';
+    if (anthropic) {
+      try {
+        visionOut = await generateWithClaude({
+          prompt: visionPrompt,
+          maxTokens: 400,
+          images: [{ mediaType: imgMime, data: imgBuf.toString('base64') }],
+        });
+      } catch (e: any) {
+        console.warn('extract-theme: Claude vision failed, trying OpenAI:', String(e?.message || e).slice(0, 200));
+      }
+    }
+    if (!visionOut) {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: visionPrompt },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ] as any,
+          },
+        ],
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 400,
+      });
+      visionOut = response.choices[0]?.message?.content || '';
+    }
+    const parsed = JSON.parse(cleanJson(visionOut) || '{}');
 
     // 3. Validate + assemble the theme. Invalid fields are dropped — the
     //    composition's resolveBrand() fills any gaps from DEFAULT_BRAND.
@@ -4260,36 +4349,66 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
     return res.status(400).json({ error: "Prompt is required" });
   }
 
-  // Try Gemini with the inline file first (it reads PDF/DOCX/TXT/MD natively).
-  let geminiError: any = null;
-  if (process.env.GEMINI_API_KEY) {
+  // Try Claude first — it reads PDF (as a document part), images (as image
+  // parts), and text natively. DOCX still needs mammoth extraction. jsonMode
+  // is enforced via a strong "return only JSON" instruction (Claude doesn't
+  // have a strict json_object switch like OpenAI).
+  let claudeError: any = null;
+  if (anthropic) {
     try {
-      console.log(`generate-from-file: trying Gemini${fileMimeType ? ` (file: ${fileMimeType})` : ''}...`);
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const parts: any[] = [];
+      console.log(`generate-from-file: trying Claude${fileMimeType ? ` (file: ${fileMimeType})` : ''}...`);
+      const content: any[] = [];
       if (fileData && fileMimeType) {
-        parts.push({ inlineData: { data: fileData, mimeType: fileMimeType } });
+        if (fileMimeType === 'application/pdf' || /pdf$/i.test(fileMimeType)) {
+          content.push({
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: fileData },
+          });
+        } else if (fileMimeType.startsWith('image/')) {
+          content.push({
+            type: 'image',
+            source: { type: 'base64', media_type: fileMimeType, data: fileData },
+          });
+        } else if (
+          fileMimeType.includes('wordprocessingml') ||
+          /docx$/i.test(fileMimeType)
+        ) {
+          const buf = Buffer.from(fileData, 'base64');
+          const extracted = await extractDocxText(buf, 60000);
+          if (extracted) {
+            content.push({ type: 'text', text: `SOURCE DOCX CONTENT:\n\n${extracted}\n\n---` });
+          }
+        } else if (fileMimeType.startsWith('text/') || /(markdown|plain)/i.test(fileMimeType)) {
+          try {
+            const decoded = Buffer.from(fileData, 'base64').toString('utf-8').slice(0, 60000);
+            content.push({ type: 'text', text: `SOURCE FILE CONTENT:\n\n${decoded}\n\n---` });
+          } catch {
+            /* ignore decode failure */
+          }
+        }
       }
-      parts.push({ text: prompt });
+      const finalPrompt = jsonMode
+        ? `${prompt}\n\nReturn ONLY valid JSON. No prose, no code fences.`
+        : prompt;
+      content.push({ type: 'text', text: finalPrompt });
 
-      const config: any = {};
-      if (jsonMode) config.responseMimeType = 'application/json';
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: { role: 'user', parts },
-        config,
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: maxTokens || 4096,
+        messages: [{ role: 'user', content }],
       });
-
-      const text = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text;
+      const block = response.content.find((b) => b.type === 'text') as
+        | { type: 'text'; text: string }
+        | undefined;
+      const text = block?.text || '';
       if (text) {
-        console.log('generate-from-file: Gemini success');
-        return res.json({ text, provider: 'gemini', success: true });
+        console.log('generate-from-file: Claude success');
+        return res.json({ text, provider: 'claude', success: true });
       }
-      throw new Error('No text in Gemini response');
+      throw new Error('No text in Claude response');
     } catch (err: any) {
-      geminiError = err;
-      console.warn('generate-from-file: Gemini failed, trying OpenAI:', String(err?.message || err).slice(0, 200));
+      claudeError = err;
+      console.warn('generate-from-file: Claude failed, trying OpenAI:', String(err?.message || err).slice(0, 200));
     }
   }
 
@@ -4351,18 +4470,18 @@ app.post("/api/ai/generate-from-file", requireRole("CREATOR"), async (req, res) 
       const text = response.choices[0]?.message?.content;
       if (!text) throw new Error('No text in OpenAI response');
       console.log('generate-from-file: OpenAI fallback success');
-      return res.json({ text, provider: 'openai', success: true, fellBackFrom: 'gemini' });
+      return res.json({ text, provider: 'openai', success: true, fellBackFrom: 'claude' });
     } catch (err: any) {
       console.error('generate-from-file: OpenAI failed:', String(err?.message || err).slice(0, 300));
       return res.status(500).json({
         error: 'File-bearing generation failed across all providers',
-        geminiError: geminiError ? String(geminiError?.message || geminiError).slice(0, 300) : undefined,
+        claudeError: claudeError ? String(claudeError?.message || claudeError).slice(0, 300) : undefined,
         openaiError: String(err?.message || err).slice(0, 300),
       });
     }
   }
 
-  return res.status(500).json({ error: 'No AI provider available', details: String(geminiError?.message || geminiError) });
+  return res.status(500).json({ error: 'No AI provider available', details: String(claudeError?.message || claudeError) });
 });
 
 // ============ TAKEAWAYS GENERATION ============

@@ -15,6 +15,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
     "@google-cloud/storage": "^7.18.0",
     "@google/genai": "^1.33.0",
     "@neondatabase/serverless": "^1.0.2",
