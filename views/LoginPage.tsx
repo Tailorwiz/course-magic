@@ -178,7 +178,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLogin, onRegister, onSwi
                 <Users size={22} style={{ color: '#D4AF37' }} />
               </div>
               <div className="text-left">
-                <p className="stat-number font-bold text-xl tracking-tight">70K+</p>
+                <p className="stat-number font-bold text-xl tracking-tight">80K+</p>
                 <p className="stat-label font-semibold text-xs uppercase tracking-wider">LinkedIn Followers</p>
               </div>
             </div>
